@@ -86,6 +86,12 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned
 .\install.ps1
 ```
 
+For installer flow testing on unsupported hardware, you can bypass the GPU gate:
+
+```powershell
+.\install.ps1 -Debug
+```
+
 After install, activate the Splatter venv and run the unified app:
 
 ```powershell

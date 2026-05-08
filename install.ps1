@@ -5,6 +5,7 @@
 
     Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned
     .\install.ps1
+    .\install.ps1 -Debug   # test mode: bypass GPU compatibility gate
 
   This script will:
     - Verify that an RTX-class NVIDIA GPU (compute capability >= 7.0) is available
@@ -18,7 +19,9 @@
   it will emit a clear message and exit with a non-zero code instead of guessing.
 #>
 
-param()
+param(
+    [switch]$Debug
+)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
@@ -64,7 +67,11 @@ function Get-GpuInfo {
 Write-Info "Checking for compatible NVIDIA GPU..."
 $gpus = @(Get-GpuInfo)
 if ($gpus.Count -eq 0) {
-    Fail "No NVIDIA GPU detected via nvidia-smi. 3DGRUT requires an RTX-class NVIDIA GPU (compute capability >= 7.0)."
+    if ($Debug) {
+        Write-Warn "Debug mode enabled: skipping NVIDIA GPU compatibility gate (no GPU detected)."
+    } else {
+        Fail "No NVIDIA GPU detected via nvidia-smi. 3DGRUT requires an RTX-class NVIDIA GPU (compute capability >= 7.0)."
+    }
 }
 
 $supported = $false
@@ -78,12 +85,16 @@ foreach ($gpu in $gpus) {
     }
 }
 
-if (-not $supported) {
+if (($gpus.Count -gt 0) -and (-not $supported)) {
     Write-Warn "Detected NVIDIA GPU(s):"
     foreach ($gpu in $gpus) {
         Write-Warn "  - $($gpu.Name)"
     }
-    Fail "No RTX-class NVIDIA GPU detected. 3DGRUT kernels target RTX-generation GPUs only. Please upgrade to an RTX 20/30/40/50 series card and rerun this installer."
+    if ($Debug) {
+        Write-Warn "Debug mode enabled: proceeding despite non-RTX GPU(s)."
+    } else {
+        Fail "No RTX-class NVIDIA GPU detected. 3DGRUT kernels target RTX-generation GPUs only. Please upgrade to an RTX 20/30/40/50 series card and rerun this installer."
+    }
 }
 
 ### 1. Ensure Python is available
