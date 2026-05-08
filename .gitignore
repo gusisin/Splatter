@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+.venv-splatter/
+venv/
+env/
+ENV/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+.DS_Store
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+
+# Local app artifacts
+gui_presets.json
+stills_app_settings.json
+stills/
+outputs/
+runs/
+logs/
+tools/
+*.log
+
+# Gradio temp/cache
+.gradio/
+gradio_cached_examples/
+tmp/
