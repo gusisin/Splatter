@@ -28,7 +28,7 @@ This repository keeps `3dgrut` itself untouched and provides an orchestration la
   - Single app entrypoint with tabs for:
     - Produce stills + COLMAP files
     - Train splat
-    - Display splat (placeholder)
+    - Display/View splat outputs (run browser + preview gallery + open-folder actions)
 
 ## Requirements
 
@@ -75,6 +75,7 @@ If your GPU is not in a supported class, install will stop early with guidance.
 5. Use:
    - **Produce Stills and COLMAP Files** tab first
    - then **Train Splat** tab
+   - then **Display Splat** tab to browse outputs
 
 ## Quick Start
 
@@ -112,6 +113,7 @@ python .\gui_wrapper.py
 4. Run **Prepare COLMAP Dataset**
 5. Switch to **Train Splat**
 6. Load the splat session and start training
+7. Switch to **Display Splat** to browse run outputs and preview generated assets
 
 ## Repository Layout
 

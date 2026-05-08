@@ -178,6 +178,7 @@ Write-Host "  powershell -ExecutionPolicy RemoteSigned"
 Write-Host "  Set-Location `"$ScriptRoot`""
 Write-Host "  .\.venv-splatter\Scripts\Activate.ps1"
 Write-Host "  python .\splatter_app.py"
+Write-Host "  # Tabs: Produce Stills + COLMAP, Train Splat, Display Splat"
 Write-Host ""
 Write-Host "Optional advanced usage (individual apps):" -ForegroundColor Cyan
 Write-Host "  powershell -ExecutionPolicy RemoteSigned"
