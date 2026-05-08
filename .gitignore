@@ -40,4 +40,5 @@ tools/
 # Gradio temp/cache
 .gradio/
 gradio_cached_examples/
+_stills_gallery_cache/
 tmp/

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import re
@@ -8,15 +9,176 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
+import traceback
 from pathlib import Path
 from typing import Any
 
 import gradio as gr
+from PIL import Image
 
 APP_DIR = Path(__file__).resolve().parent
 SETTINGS_FILE = APP_DIR / "stills_app_settings.json"
 MAX_LOG_CHARS = 250_000
 DEFAULT_BASE_DIR = Path.home() / "Pictures" / "Splatter"
+GALLERY_CACHE_DIR = APP_DIR / "_stills_gallery_cache"
+
+logger = logging.getLogger("splatter.stills")
+logger.propagate = False
+if not logger.handlers:
+    _handler = logging.StreamHandler(sys.stderr)
+    _handler.setFormatter(logging.Formatter("[splatter-stills] %(levelname)s: %(message)s"))
+    logger.addHandler(_handler)
+logger.setLevel(logging.INFO)
+
+
+def _console(msg: str, level: str = "INFO") -> None:
+    """Always visible in the terminal (Gradio may swallow logging on some setups)."""
+    print(f"[splatter-stills] {level}: {msg}", flush=True)
+    if level == "ERROR":
+        logger.error(msg)
+    elif level == "WARNING":
+        logger.warning(msg)
+    else:
+        logger.info(msg)
+
+
+MAX_GALLERY_FRAMES = 400
+GALLERY_THUMB_MAX = 512
+
+
+def _gallery_items_from_frames(frames: list[Path]) -> list[Any]:
+    """Write thumbnails under the repo (allowed by splatter_app launch) and return (path, caption) pairs."""
+    items: list[Any] = []
+    try:
+        if GALLERY_CACHE_DIR.exists():
+            shutil.rmtree(GALLERY_CACHE_DIR)
+        GALLERY_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        _console(f"Could not reset gallery cache at {GALLERY_CACHE_DIR}: {exc}", "ERROR")
+        return items
+
+    shown = frames[:MAX_GALLERY_FRAMES]
+    if len(frames) > MAX_GALLERY_FRAMES:
+        _console(f"Gallery capped: showing first {MAX_GALLERY_FRAMES} of {len(frames)} frames", "WARNING")
+
+    _resample = getattr(Image, "Resampling", Image).LANCZOS
+    for i, p in enumerate(shown):
+        rp = p.resolve()
+        try:
+            if not rp.is_file():
+                _console(f"Gallery skip (not a file): {rp}", "WARNING")
+                continue
+            with Image.open(rp) as im:
+                thumb = im.convert("RGB")
+                thumb.thumbnail((GALLERY_THUMB_MAX, GALLERY_THUMB_MAX), _resample)
+                to_save = thumb.copy()
+            safe_name = re.sub(r"[^a-zA-Z0-9._-]+", "_", rp.name) or "frame.png"
+            out_path = GALLERY_CACHE_DIR / f"{i:04d}_{safe_name}"
+            to_save.save(out_path, format="PNG")
+            items.append((str(out_path.resolve()), rp.name))
+        except OSError as exc:
+            _console(f"Gallery skip {rp}: {exc}", "WARNING")
+        except Exception as exc:
+            _console(f"Gallery unexpected error for {rp}: {exc}", "ERROR")
+            traceback.print_exc()
+
+    _console(f"Gallery cache: wrote {len(items)} PNG(s) under {GALLERY_CACHE_DIR} (source frames on disk: {len(frames)})")
+    return items
+
+
+def _frames_state_default() -> dict[str, list[Any]]:
+    """Tracks the current gallery contents and which indices are selected for deletion."""
+    return {"frames": [], "thumbs": [], "selected": []}
+
+
+def _selection_summary(fs: dict[str, Any]) -> str:
+    n_total = len(fs.get("frames") or [])
+    n_sel = len(fs.get("selected") or [])
+    if n_total == 0:
+        return "_No frames yet — extract in Step 3, then click thumbnails to mark for deletion._"
+    if n_sel == 0:
+        return f"**Selected:** 0 / {n_total} _(click a thumbnail to mark for deletion)_"
+    return f"**Selected:** {n_sel} / {n_total}"
+
+
+def _render_gallery_items(fs: dict[str, Any]) -> list[Any]:
+    """Build (thumb_path, caption) pairs with a marker on selected items."""
+    selected = set(fs.get("selected") or [])
+    out: list[Any] = []
+    thumbs = fs.get("thumbs") or []
+    frames = fs.get("frames") or []
+    for i, (thumb, frame) in enumerate(zip(thumbs, frames)):
+        name = Path(frame).name
+        caption = f"[X] {name}" if i in selected else name
+        out.append((thumb, caption))
+    return out
+
+
+def _update_frame_review_ui(state: dict[str, Any]):
+    """Rebuild the frames_state, gallery, and selection summary in a follow-up step.
+
+    Includes a short pause so Windows can finish releasing ffmpeg file handles before we read PNGs.
+    """
+    if not state.get("initialized"):
+        empty = _frames_state_default()
+        return empty, gr.update(value=[]), gr.update(value=_selection_summary(empty))
+    time.sleep(0.15)
+    stills_dir = Path(state["stills_dir"])
+    splat_name = state["splat_name"]
+    frames = sorted(stills_dir.glob(f"{splat_name}-*.png"))
+    _console(
+        f"_update_frame_review_ui: after 0.15s settle, matched {len(frames)} file(s) under {stills_dir}"
+    )
+    try:
+        thumb_items = _gallery_items_from_frames(frames)
+    except Exception as exc:
+        _console(f"Gallery build raised (review ui): {exc}", "ERROR")
+        traceback.print_exc()
+        thumb_items = []
+
+    fs: dict[str, Any] = {
+        "frames": [str(p) for p in frames[: len(thumb_items)]],
+        "thumbs": [item[0] for item in thumb_items],
+        "selected": [],
+    }
+    return fs, gr.update(value=_render_gallery_items(fs)), gr.update(value=_selection_summary(fs))
+
+
+def on_gallery_click(fs: dict[str, Any], evt: gr.SelectData):
+    fs = fs or _frames_state_default()
+    idx = getattr(evt, "index", None)
+    if idx is None:
+        return fs, gr.update(), gr.update()
+    idx = int(idx)
+    sel = list(fs.get("selected") or [])
+    if idx in sel:
+        sel.remove(idx)
+    else:
+        sel.append(idx)
+        sel.sort()
+    fs["selected"] = sel
+    return fs, gr.update(value=_render_gallery_items(fs)), gr.update(value=_selection_summary(fs))
+
+
+def select_all_frames(fs: dict[str, Any]):
+    fs = fs or _frames_state_default()
+    fs["selected"] = list(range(len(fs.get("frames") or [])))
+    return fs, gr.update(value=_render_gallery_items(fs)), gr.update(value=_selection_summary(fs))
+
+
+def clear_selection(fs: dict[str, Any]):
+    fs = fs or _frames_state_default()
+    fs["selected"] = []
+    return fs, gr.update(value=_render_gallery_items(fs)), gr.update(value=_selection_summary(fs))
+
+
+def invert_selection(fs: dict[str, Any]):
+    fs = fs or _frames_state_default()
+    n = len(fs.get("frames") or [])
+    cur = set(fs.get("selected") or [])
+    fs["selected"] = sorted(set(range(n)) - cur)
+    return fs, gr.update(value=_render_gallery_items(fs)), gr.update(value=_selection_summary(fs))
 
 
 def _append_log(current: str, text: str) -> str:
@@ -98,7 +260,36 @@ def _estimate_frame_count(duration: float, fps: float) -> int:
 
 
 def _build_media_table(media: list[dict[str, Any]]) -> list[list[Any]]:
-    return [[m["path"], f"{m['duration']:.2f}", f"{m['start']:.2f}", f"{m['end']:.2f}", m["status"]] for m in media]
+    rows: list[list[Any]] = []
+    for m in media:
+        path = m["path"]
+        rows.append(
+            [
+                Path(path).name,
+                f"{m['duration']:.2f}",
+                f"{m['start']:.2f}",
+                f"{m['end']:.2f}",
+                m["status"],
+                path,
+            ]
+        )
+    return rows
+
+
+def _queue_summary_text(media: list[dict[str, Any]]) -> str:
+    n = len([m for m in media if m.get("status") == "ready"])
+    if n == 0:
+        return "_Queue: empty — drag video(s) above, then click **Add to Queue**._"
+    return f"**Queue: {n} video(s) ready.**"
+
+
+def _add_to_queue_update(upload_value: Any, state: dict[str, Any]):
+    """Highlight the Add to Queue button in primary colour when uploads are pending."""
+    if not (state or {}).get("initialized"):
+        return gr.update(interactive=False, variant="secondary")
+    if _extract_file_paths(upload_value):
+        return gr.update(interactive=True, variant="primary")
+    return gr.update(interactive=False, variant="secondary")
 
 
 def _estimate_summary(media: list[dict[str, Any]], fps: float) -> str:
@@ -165,6 +356,86 @@ def _workflow_ui_updates(state: dict[str, Any]):
     )
 
 
+def _norm_path(p: Path | str | None) -> str:
+    if not p:
+        return ""
+    try:
+        return os.path.normcase(os.path.normpath(str(Path(str(p)).expanduser().resolve())))
+    except OSError:
+        return os.path.normcase(os.path.normpath(str(p)))
+
+
+def _preview_session_path(name: str, base: str, state: dict[str, Any]):
+    """Live preview of the resolved splat directory + Create button gating.
+
+    After a successful Create, the folder exists by design — that must not be shown as a conflict.
+    """
+    state = state or {}
+    raw = (name or "").strip()
+    cleaned = _sanitize_splat_name(raw)
+    if not cleaned:
+        return (
+            gr.update(value="_Enter a session name to continue._"),
+            gr.update(interactive=False),
+        )
+    base_path = Path((base or "").strip()).expanduser() if (base or "").strip() else DEFAULT_BASE_DIR
+    splat_dir = base_path / cleaned
+    sanitized_note = "" if cleaned == raw else f" _(sanitized from `{raw}`)_"
+
+    if state.get("initialized") and str(state.get("splat_name") or "") == cleaned:
+        if _norm_path(state.get("splat_dir")) == _norm_path(splat_dir):
+            return (
+                gr.update(
+                    value=(
+                        f"**Active session** at `{splat_dir}`{sanitized_note}\n\n"
+                        "_Folder created — continue with Step 2._"
+                    )
+                ),
+                gr.update(interactive=False),
+            )
+
+    if splat_dir.exists():
+        try:
+            entries = list(splat_dir.iterdir())
+        except OSError:
+            entries = []
+        empties = "empty folder" if not entries else f"non-empty folder ({len(entries)} item(s))"
+        return (
+            gr.update(
+                value=(
+                    f"**Conflict (build-test):** {empties} already exists at `{splat_dir}`. "
+                    "Choose a different name or delete that folder."
+                )
+            ),
+            gr.update(interactive=False),
+        )
+    return (
+        gr.update(value=f"Will create: `{splat_dir}`{sanitized_note}"),
+        gr.update(interactive=True),
+    )
+
+
+def _extract_inline_error(log_text: str):
+    """Surface the most recent [ERROR] line as a visible banner.
+
+    Walks the log from the bottom up: the first [ERROR] wins, but if an
+    [INFO] line is seen first the banner is cleared (the error has been
+    superseded by a later successful action).
+    """
+    if not log_text:
+        return gr.update(value="", visible=False)
+    for line in reversed(log_text.splitlines()):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if "[ERROR]" in stripped:
+            msg = stripped.split("[ERROR]", 1)[-1].strip()
+            return gr.update(value=f"**Last error:** {msg}", visible=True)
+        if stripped.startswith("[INFO]"):
+            return gr.update(value="", visible=False)
+    return gr.update(value="", visible=False)
+
+
 def on_fps_changed(fps: float, state: dict[str, Any]):
     if not state.get("initialized"):
         return state, gr.update(value="No media loaded."), gr.update(interactive=False)
@@ -180,23 +451,18 @@ def _write_manifest(state: dict[str, Any], fps: float, max_width: int) -> None:
         return
     splat_dir = Path(state["splat_dir"])
     stills_dir = Path(state["stills_dir"])
-    rejected_dir = Path(state["rejected_dir"])
     splat_name = state["splat_name"]
     frames = sorted(stills_dir.glob(f"{splat_name}-*.png"))
-    rejected = sorted(rejected_dir.glob(f"{splat_name}-*.png"))
     payload = {
         "splat_name": splat_name,
         "splat_dir": str(splat_dir),
         "stills_dir": str(stills_dir),
-        "rejected_dir": str(rejected_dir),
         "settings": {"fps": float(fps), "max_width": int(max_width)},
         "source_media": state.get("media", []),
         "dataset_path": state.get("dataset_path", ""),
         "colmap_prepared": bool(state.get("colmap_prepared", False)),
         "stills_count": len(frames),
-        "rejected_count": len(rejected),
         "stills_files": [p.name for p in frames],
-        "rejected_files": [p.name for p in rejected],
     }
     (splat_dir / "manifest.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
@@ -393,6 +659,7 @@ def prepare_colmap_dataset(state: dict[str, Any], log_text: str, progress=gr.Pro
 
 def initialize_splat(splat_name: str, base_output_dir: str, fps: float, max_width: int, log_text: str):
     cleaned = _sanitize_splat_name(splat_name)
+    empty_fs = _frames_state_default()
     if not cleaned:
         return (
             _append_log(log_text, "[ERROR] Enter a valid splat name.\n"),
@@ -400,21 +667,20 @@ def initialize_splat(splat_name: str, base_output_dir: str, fps: float, max_widt
             gr.update(value=""),
             gr.update(interactive=False),
             gr.update(interactive=False),
-            gr.update(interactive=False, value=""),
             gr.update(interactive=False),
-            gr.update(interactive=False),
+            gr.update(interactive=False, variant="secondary"),
             gr.update(interactive=False),
             gr.update(value=[]),
+            gr.update(value=_queue_summary_text([])),
             gr.update(value="No media loaded."),
             gr.update(interactive=False),
             gr.update(value=[]),
-            gr.update(choices=[], value=[]),
+            empty_fs,
         )
 
     base = Path(base_output_dir).expanduser()
     splat_dir = base / cleaned
     stills_dir = splat_dir / "stills"
-    rejected_dir = splat_dir / "rejected"
     if splat_dir.exists():
         return (
             _append_log(log_text, f"[ERROR] Splat '{cleaned}' already exists: {splat_dir}\n"),
@@ -422,26 +688,24 @@ def initialize_splat(splat_name: str, base_output_dir: str, fps: float, max_widt
             gr.update(value=""),
             gr.update(interactive=False),
             gr.update(interactive=False),
-            gr.update(interactive=False, value=""),
             gr.update(interactive=False),
-            gr.update(interactive=False),
+            gr.update(interactive=False, variant="secondary"),
             gr.update(interactive=False),
             gr.update(value=[]),
+            gr.update(value=_queue_summary_text([])),
             gr.update(value="No media loaded."),
             gr.update(interactive=False),
             gr.update(value=[]),
-            gr.update(choices=[], value=[]),
+            empty_fs,
         )
 
     stills_dir.mkdir(parents=True, exist_ok=True)
-    rejected_dir.mkdir(parents=True, exist_ok=True)
     _save_settings(str(base), float(fps), int(max_width))
     state = {
         "initialized": True,
         "splat_name": cleaned,
         "splat_dir": str(splat_dir),
         "stills_dir": str(stills_dir),
-        "rejected_dir": str(rejected_dir),
         "fps": float(fps),
         "max_width": int(max_width),
         "media": [],
@@ -454,33 +718,33 @@ def initialize_splat(splat_name: str, base_output_dir: str, fps: float, max_widt
         gr.update(value=str(stills_dir)),
         gr.update(interactive=True),
         gr.update(interactive=True),
-        gr.update(interactive=True, value=""),
         gr.update(interactive=True),
-        gr.update(interactive=True),
+        gr.update(interactive=False, variant="secondary"),
         gr.update(interactive=False),
         gr.update(value=[]),
+        gr.update(value=_queue_summary_text([])),
         gr.update(value=_estimate_summary([], float(fps))),
         gr.update(interactive=True),
         gr.update(value=[]),
-        gr.update(choices=[], value=[]),
+        empty_fs,
     )
 
 
-def add_media(paths_text: str, uploaded_files: Any, fps: float, state: dict[str, Any], log_text: str):
+def add_media(uploaded_files: Any, fps: float, state: dict[str, Any], log_text: str):
     if not state.get("initialized"):
         return (
             _append_log(log_text, "[ERROR] Initialize a unique splat name first.\n"),
             state,
             gr.update(value=[]),
+            gr.update(value=_queue_summary_text([])),
             gr.update(value="No media loaded."),
             gr.update(interactive=False),
-            gr.update(value=""),
+            gr.update(value=None),
+            gr.update(interactive=False, variant="secondary"),
         )
     media = list(state.get("media", []))
     existing = {m["path"] for m in media}
     candidates: list[str] = []
-    if paths_text.strip():
-        candidates.extend([line.strip() for line in paths_text.splitlines() if line.strip()])
     candidates.extend(_extract_file_paths(uploaded_files))
 
     log = log_text
@@ -510,9 +774,11 @@ def add_media(paths_text: str, uploaded_files: Any, fps: float, state: dict[str,
         log,
         state,
         gr.update(value=_build_media_table(media)),
+        gr.update(value=_queue_summary_text(media)),
         gr.update(value=_estimate_summary(media, float(fps))),
         gr.update(interactive=can_generate),
-        gr.update(value=""),
+        gr.update(value=None),
+        gr.update(interactive=False, variant="secondary"),
     )
 
 
@@ -524,13 +790,12 @@ def generate_stills(
     progress=gr.Progress(track_tqdm=False),
 ):
     if not state.get("initialized"):
-        return log_text, state, gr.update(value=[]), gr.update(choices=[], value=[]), gr.update(value="No media loaded.")
+        return log_text, state, gr.update(value="No media loaded.")
     if shutil.which("ffmpeg") is None:
+        _console("ffmpeg not found on PATH", "ERROR")
         return (
             _append_log(log_text, "[ERROR] ffmpeg not found in PATH.\n"),
             state,
-            gr.update(value=[]),
-            gr.update(choices=[], value=[]),
             gr.update(value="No media loaded."),
         )
     media = [m for m in state.get("media", []) if m.get("status") == "ready"]
@@ -538,16 +803,12 @@ def generate_stills(
         return (
             _append_log(log_text, "[ERROR] No ready media to process.\n"),
             state,
-            gr.update(value=[]),
-            gr.update(choices=[], value=[]),
             gr.update(value="No media loaded."),
         )
     if fps <= 0:
         return (
             _append_log(log_text, "[ERROR] FPS must be greater than 0.\n"),
             state,
-            gr.update(value=[]),
-            gr.update(choices=[], value=[]),
             gr.update(value="No media loaded."),
         )
     state["fps"] = float(fps)
@@ -582,6 +843,7 @@ def generate_stills(
         result = subprocess.run(cmd, capture_output=True, text=True, check=False)
         if result.returncode != 0:
             log = _append_log(log, f"[ERROR] ffmpeg failed for {src.name}\n{result.stderr}\n")
+            _console(f"ffmpeg failed for {src.name} rc={result.returncode}", "ERROR")
             continue
         if result.stderr:
             log = _append_log(log, result.stderr + "\n")
@@ -591,49 +853,57 @@ def generate_stills(
 
     frames = sorted(stills_dir.glob(f"{splat_name}-*.png"))
     frame_paths = [str(p) for p in frames]
-    choices = [(p.name, str(p)) for p in frames]
+    _console(f"generate_stills: glob matched {len(frames)} file(s) under {stills_dir} (UI refresh is next step)")
     _write_manifest(state, float(fps), int(max_width))
     log = _append_log(log, f"[INFO] Extraction complete. Total frames: {len(frame_paths)}\n")
-    return log, state, gr.update(value=frame_paths), gr.update(choices=choices, value=[]), gr.update(
-        value=_estimate_summary(media, float(fps))
+    _console(
+        f"Extraction finished splat={splat_name} count={len(frames)} "
+        f"first={frame_paths[0] if frame_paths else None}"
     )
+    return log, state, gr.update(value=_estimate_summary(media, float(fps)))
 
 
 def refresh_frames(state: dict[str, Any], log_text: str):
     if not state.get("initialized"):
-        return log_text, gr.update(value=[]), gr.update(choices=[], value=[])
+        return log_text
     stills_dir = Path(state["stills_dir"])
     splat_name = state["splat_name"]
     frames = sorted(stills_dir.glob(f"{splat_name}-*.png"))
-    frame_paths = [str(p) for p in frames]
-    choices = [(p.name, str(p)) for p in frames]
-    log = _append_log(log_text, f"[INFO] Refreshed frames: {len(frame_paths)}\n")
-    return log, gr.update(value=frame_paths), gr.update(choices=choices, value=[])
+    log = _append_log(log_text, f"[INFO] Refreshed frames: {len(frames)}\n")
+    _console(f"refresh_frames splat={splat_name} count={len(frames)} dir={stills_dir}")
+    return log
 
 
-def reject_selected_frames(selected: list[str], state: dict[str, Any], log_text: str):
+def reject_selected_frames(fs: dict[str, Any], state: dict[str, Any], log_text: str):
+    """Permanently delete the frames the user has selected in the gallery."""
     if not state.get("initialized"):
-        return log_text, gr.update(value=[]), gr.update(choices=[], value=[])
-    if not selected:
-        return _append_log(log_text, "[INFO] No frames selected for rejection.\n"), gr.update(), gr.update()
+        return log_text
+    fs = fs or _frames_state_default()
+    sel = list(fs.get("selected") or [])
+    frames = list(fs.get("frames") or [])
+    if not sel:
+        return _append_log(log_text, "[INFO] No frames selected for deletion.\n")
 
-    rejected_dir = Path(state["rejected_dir"])
-    moved = 0
+    deleted = 0
     log = log_text
-    for raw in selected:
-        src = Path(raw)
-        if not src.exists():
+    for idx in sel:
+        if idx < 0 or idx >= len(frames):
             continue
-        dst = rejected_dir / src.name
+        src = Path(frames[idx])
+        if not src.exists():
+            _console(f"Delete skip (missing): {src}", "WARNING")
+            continue
         try:
-            shutil.move(str(src), str(dst))
-            moved += 1
-        except Exception as exc:
-            log = _append_log(log, f"[WARN] Failed to move {src.name}: {exc}\n")
+            src.unlink()
+            deleted += 1
+        except OSError as exc:
+            log = _append_log(log, f"[WARN] Failed to delete {src.name}: {exc}\n")
+            _console(f"Delete failed {src}: {exc}", "WARNING")
 
     _write_manifest(state, float(state.get("fps", 1.0)), int(state.get("max_width", 0)))
-    log = _append_log(log, f"[INFO] Rejected {moved} frames (moved to {rejected_dir}). Manifest updated.\n")
-    return refresh_frames(state, log)
+    log = _append_log(log, f"[INFO] Deleted {deleted} frame(s). Manifest updated.\n")
+    _console(f"reject_selected deleted={deleted}")
+    return log
 
 
 settings = _load_settings()
@@ -649,7 +919,8 @@ with gr.Blocks(title="Splatter Stills Extractor V2") as demo:
                 gr.Markdown("### Step 1 - Create Session")
                 with gr.Row():
                     splat_name = gr.Textbox(label="Splat name (must be unique)", placeholder="my_splat")
-                    initialize_button = gr.Button("Create Session", variant="primary")
+                    initialize_button = gr.Button("Create Session", variant="primary", interactive=False)
+                name_preview = gr.Markdown("_Enter a session name to continue._")
                 with gr.Row():
                     base_output_dir = gr.Textbox(label="Base output directory", value=settings["base_output_dir"], scale=3)
                     output_dir_preview = gr.Textbox(label="Stills output directory", value="", interactive=False, scale=2)
@@ -657,25 +928,18 @@ with gr.Blocks(title="Splatter Stills Extractor V2") as demo:
             step2_group = gr.Group(visible=False)
             with step2_group:
                 gr.Markdown("### Step 2 - Add Media")
-                with gr.Row():
-                    media_paths = gr.Textbox(
-                        label="Media paths (one per line) - preferred",
-                        placeholder="E:\\video1.mp4\nE:\\video2.mp4",
-                        lines=4,
-                        interactive=False,
-                        scale=2,
-                    )
-                    media_upload = gr.File(
-                        label="Or upload media files",
-                        file_count="multiple",
-                        file_types=["video"],
-                        type="filepath",
-                        interactive=False,
-                        scale=1,
-                    )
-                add_media_button = gr.Button("Add to Queue", interactive=False)
+                gr.Markdown("_Drag video files into the box below, then click **Add to Queue**._")
+                media_upload = gr.File(
+                    label="Upload media files",
+                    file_count="multiple",
+                    file_types=["video"],
+                    type="filepath",
+                    interactive=False,
+                )
+                add_media_button = gr.Button("Add to Queue", variant="secondary", interactive=False)
+                queue_summary = gr.Markdown(_queue_summary_text([]))
                 media_table = gr.Dataframe(
-                    headers=["path", "duration_sec", "start_sec", "end_sec", "status"],
+                    headers=["name", "duration_sec", "start_sec", "end_sec", "status", "path"],
                     value=[],
                     interactive=False,
                     wrap=True,
@@ -699,11 +963,23 @@ with gr.Blocks(title="Splatter Stills Extractor V2") as demo:
             step4_group = gr.Group(visible=False)
             with step4_group:
                 gr.Markdown("### Step 4 - Review and Curate")
+                gr.Markdown("_Click a thumbnail to mark it for deletion. Selected items get an `[X]` in the caption._")
+                frames_state = gr.State(_frames_state_default())
+                selection_summary = gr.Markdown(_selection_summary(_frames_state_default()))
                 with gr.Row():
+                    select_all_button = gr.Button("Select All", interactive=False)
+                    invert_button = gr.Button("Invert Selection", interactive=False)
+                    clear_button = gr.Button("Clear Selection", interactive=False)
                     refresh_frames_button = gr.Button("Refresh Frames", interactive=False)
-                    reject_button = gr.Button("Reject Selected Frames", interactive=False)
-                frame_gallery = gr.Gallery(label="Extracted frames", columns=6, height=320)
-                frame_selector = gr.CheckboxGroup(label="Select frames to reject", choices=[], value=[])
+                frame_gallery = gr.Gallery(
+                    label="Extracted frames (click to select)",
+                    columns=6,
+                    height=360,
+                    object_fit="cover",
+                    show_label=True,
+                    interactive=False,
+                )
+                reject_button = gr.Button("Delete Selected Frames", variant="stop", interactive=False)
 
             step5_group = gr.Group(visible=False)
             with step5_group:
@@ -720,7 +996,26 @@ with gr.Blocks(title="Splatter Stills Extractor V2") as demo:
         else "COLMAP status: `colmap` not found in PATH. Install COLMAP to enable preparation."
     )
     colmap_status = gr.Markdown(initial_colmap_msg)
-    log_output = gr.Code(label="Execution Console", value="", language="shell", lines=16, interactive=False)
+    last_error = gr.Markdown("", visible=False)
+    with gr.Accordion("Execution log", open=False):
+        log_output = gr.Textbox(
+            label="Execution Console",
+            value="",
+            lines=16,
+            max_lines=32,
+            interactive=False,
+        )
+
+    splat_name.change(
+        fn=_preview_session_path,
+        inputs=[splat_name, base_output_dir, state],
+        outputs=[name_preview, initialize_button],
+    )
+    base_output_dir.change(
+        fn=_preview_session_path,
+        inputs=[splat_name, base_output_dir, state],
+        outputs=[name_preview, initialize_button],
+    )
 
     initialize_button.click(
         fn=initialize_splat,
@@ -731,33 +1026,66 @@ with gr.Blocks(title="Splatter Stills Extractor V2") as demo:
             output_dir_preview,
             fps,
             max_width,
-            media_paths,
             media_upload,
             add_media_button,
             generate_button,
             media_table,
+            queue_summary,
             estimate,
             refresh_frames_button,
             frame_gallery,
-            frame_selector,
+            frames_state,
         ],
     ).then(
-        fn=lambda: (gr.update(interactive=True), gr.update(interactive=HAS_COLMAP)),
-        outputs=[reject_button, prepare_colmap_button],
+        fn=lambda: (
+            gr.update(interactive=True),
+            gr.update(interactive=HAS_COLMAP),
+            gr.update(interactive=True),
+            gr.update(interactive=True),
+            gr.update(interactive=True),
+        ),
+        outputs=[reject_button, prepare_colmap_button, select_all_button, invert_button, clear_button],
     ).then(
         fn=_workflow_ui_updates,
         inputs=[state],
         outputs=[workflow_status, next_action, step2_group, step3_group, step4_group, step5_group],
+    ).then(
+        fn=_preview_session_path,
+        inputs=[splat_name, base_output_dir, state],
+        outputs=[name_preview, initialize_button],
+    ).then(
+        fn=_extract_inline_error,
+        inputs=[log_output],
+        outputs=[last_error],
     )
 
     add_media_button.click(
         fn=add_media,
-        inputs=[media_paths, media_upload, fps, state, log_output],
-        outputs=[log_output, state, media_table, estimate, generate_button, media_paths],
+        inputs=[media_upload, fps, state, log_output],
+        outputs=[
+            log_output,
+            state,
+            media_table,
+            queue_summary,
+            estimate,
+            generate_button,
+            media_upload,
+            add_media_button,
+        ],
     ).then(
         fn=_workflow_ui_updates,
         inputs=[state],
         outputs=[workflow_status, next_action, step2_group, step3_group, step4_group, step5_group],
+    ).then(
+        fn=_extract_inline_error,
+        inputs=[log_output],
+        outputs=[last_error],
+    )
+
+    media_upload.change(
+        fn=_add_to_queue_update,
+        inputs=[media_upload, state],
+        outputs=[add_media_button],
     )
 
     fps.change(
@@ -773,31 +1101,76 @@ with gr.Blocks(title="Splatter Stills Extractor V2") as demo:
     generate_button.click(
         fn=generate_stills,
         inputs=[fps, max_width, state, log_output],
-        outputs=[log_output, state, frame_gallery, frame_selector, estimate],
+        outputs=[log_output, state, estimate],
+    ).then(
+        fn=_update_frame_review_ui,
+        inputs=[state],
+        outputs=[frames_state, frame_gallery, selection_summary],
     ).then(
         fn=_workflow_ui_updates,
         inputs=[state],
         outputs=[workflow_status, next_action, step2_group, step3_group, step4_group, step5_group],
+    ).then(
+        fn=_extract_inline_error,
+        inputs=[log_output],
+        outputs=[last_error],
     )
 
     refresh_frames_button.click(
         fn=refresh_frames,
         inputs=[state, log_output],
-        outputs=[log_output, frame_gallery, frame_selector],
+        outputs=[log_output],
+    ).then(
+        fn=_update_frame_review_ui,
+        inputs=[state],
+        outputs=[frames_state, frame_gallery, selection_summary],
     ).then(
         fn=_workflow_ui_updates,
         inputs=[state],
         outputs=[workflow_status, next_action, step2_group, step3_group, step4_group, step5_group],
+    ).then(
+        fn=_extract_inline_error,
+        inputs=[log_output],
+        outputs=[last_error],
     )
 
     reject_button.click(
         fn=reject_selected_frames,
-        inputs=[frame_selector, state, log_output],
-        outputs=[log_output, frame_gallery, frame_selector],
+        inputs=[frames_state, state, log_output],
+        outputs=[log_output],
+    ).then(
+        fn=_update_frame_review_ui,
+        inputs=[state],
+        outputs=[frames_state, frame_gallery, selection_summary],
     ).then(
         fn=_workflow_ui_updates,
         inputs=[state],
         outputs=[workflow_status, next_action, step2_group, step3_group, step4_group, step5_group],
+    ).then(
+        fn=_extract_inline_error,
+        inputs=[log_output],
+        outputs=[last_error],
+    )
+
+    frame_gallery.select(
+        fn=on_gallery_click,
+        inputs=[frames_state],
+        outputs=[frames_state, frame_gallery, selection_summary],
+    )
+    select_all_button.click(
+        fn=select_all_frames,
+        inputs=[frames_state],
+        outputs=[frames_state, frame_gallery, selection_summary],
+    )
+    invert_button.click(
+        fn=invert_selection,
+        inputs=[frames_state],
+        outputs=[frames_state, frame_gallery, selection_summary],
+    )
+    clear_button.click(
+        fn=clear_selection,
+        inputs=[frames_state],
+        outputs=[frames_state, frame_gallery, selection_summary],
     )
     prepare_colmap_button.click(
         fn=prepare_colmap_dataset,
@@ -807,6 +1180,10 @@ with gr.Blocks(title="Splatter Stills Extractor V2") as demo:
         fn=_workflow_ui_updates,
         inputs=[state],
         outputs=[workflow_status, next_action, step2_group, step3_group, step4_group, step5_group],
+    ).then(
+        fn=_extract_inline_error,
+        inputs=[log_output],
+        outputs=[last_error],
     )
 
 

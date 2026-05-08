@@ -168,5 +168,11 @@ with gr.Blocks(title="Splatter Unified App") as demo:
 
 
 if __name__ == "__main__":
-    demo.queue().launch()
+    # Allow Gradio to serve generated stills/run outputs from user-selected
+    # session directories (e.g. ~/Pictures/Splatter) and from the app folder.
+    demo.queue().launch(
+        server_name="127.0.0.1",
+        server_port=8000,
+        allowed_paths=[str(APP_DIR), str(Path.home())],
+    )
 
