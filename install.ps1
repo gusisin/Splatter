@@ -41,16 +41,16 @@ Write-Info "Using repo root: $ScriptRoot"
 
 function Get-GpuInfo {
     if (-not (Get-Command "nvidia-smi" -ErrorAction SilentlyContinue)) {
-        return @()
+        return ,@()
     }
 
     $raw = & nvidia-smi --query-gpu=name --format=csv,noheader 2>$null
     if (-not $raw) {
-        return @()
+        return ,@()
     }
 
     $list = @()
-    foreach ($line in $raw) {
+    foreach ($line in @($raw)) {
         $name = $line.Trim()
         if ($name) {
             $list += [PSCustomObject]@{
@@ -58,11 +58,11 @@ function Get-GpuInfo {
             }
         }
     }
-    return $list
+    return ,$list
 }
 
 Write-Info "Checking for compatible NVIDIA GPU..."
-$gpus = Get-GpuInfo
+$gpus = @(Get-GpuInfo)
 if ($gpus.Count -eq 0) {
     Fail "No NVIDIA GPU detected via nvidia-smi. 3DGRUT requires an RTX-class NVIDIA GPU (compute capability >= 7.0)."
 }
