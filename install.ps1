@@ -173,17 +173,18 @@ Write-Host "  - Splatter venv  : $venvPath"
 Write-Host "  - 3dgrut repo    : $grutDir"
 Write-Host "  - Python (UI)    : $venvPython"
 Write-Host ""
-Write-Host "To run the 3DGRUT training UI:" -ForegroundColor Cyan
+Write-Host "To run the unified Splatter app (recommended):" -ForegroundColor Cyan
 Write-Host "  powershell -ExecutionPolicy RemoteSigned"
 Write-Host "  Set-Location `"$ScriptRoot`""
 Write-Host "  .\.venv-splatter\Scripts\Activate.ps1"
-Write-Host "  python .\gui_wrapper.py"
+Write-Host "  python .\splatter_app.py"
 Write-Host ""
-Write-Host "To run the Stills Extractor UI:" -ForegroundColor Cyan
+Write-Host "Optional advanced usage (individual apps):" -ForegroundColor Cyan
 Write-Host "  powershell -ExecutionPolicy RemoteSigned"
 Write-Host "  Set-Location `"$ScriptRoot`""
 Write-Host "  .\.venv-splatter\Scripts\Activate.ps1"
 Write-Host "  python .\stills_extractor_app.py"
+Write-Host "  python .\gui_wrapper.py"
 Write-Host ""
 Write-Host "If 3dgrut training fails due to CUDA or compiler issues, rerun:" -ForegroundColor Yellow
 Write-Host "  cd `"$grutDir`""
