@@ -64,15 +64,11 @@ If your GPU is not in a supported class, install will stop early with guidance.
    Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned
    .\install.ps1
    ```
-3. Activate the Splatter environment:
+3. Start the unified app directly with the venv Python:
    ```powershell
-   .\.venv-splatter\Scripts\Activate.ps1
+   .\.venv-splatter\Scripts\python.exe .\splatter_app.py
    ```
-4. Start the unified app:
-   ```powershell
-   python .\splatter_app.py
-   ```
-5. Use:
+4. Use:
    - **Produce Stills and COLMAP Files** tab first
    - then **Train Splat** tab
    - then **Display Splat** tab to browse outputs
@@ -92,23 +88,20 @@ For installer flow testing on unsupported hardware, you can bypass the GPU gate:
 .\install.ps1 -Debug
 ```
 
-After install, activate the Splatter venv and run the unified app:
+After install, run the unified app directly with the Splatter venv Python:
 
 ```powershell
-.\.venv-splatter\Scripts\Activate.ps1
-python .\splatter_app.py
+.\.venv-splatter\Scripts\python.exe .\splatter_app.py
 ```
 
 Optional advanced usage (run individual apps directly):
 
 ```powershell
-.\.venv-splatter\Scripts\Activate.ps1
-python .\stills_extractor_app.py
+.\.venv-splatter\Scripts\python.exe .\stills_extractor_app.py
 ```
 
 ```powershell
-.\.venv-splatter\Scripts\Activate.ps1
-python .\gui_wrapper.py
+.\.venv-splatter\Scripts\python.exe .\gui_wrapper.py
 ```
 
 ## Typical Workflow

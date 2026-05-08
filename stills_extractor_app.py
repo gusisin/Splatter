@@ -107,6 +107,64 @@ def _estimate_summary(media: list[dict[str, Any]], fps: float) -> str:
     return f"Estimated total duration: **{total_duration:.2f}s** | Estimated stills: **{total_frames}**"
 
 
+def _state_frame_count(state: dict[str, Any]) -> int:
+    if not state.get("initialized"):
+        return 0
+    stills_dir = Path(str(state.get("stills_dir", "")))
+    splat_name = str(state.get("splat_name", ""))
+    if not stills_dir.exists() or not splat_name:
+        return 0
+    return len(list(stills_dir.glob(f"{splat_name}-*.png")))
+
+
+def _workflow_summary(state: dict[str, Any]) -> str:
+    initialized = bool(state.get("initialized"))
+    media = state.get("media", [])
+    ready_media = len([m for m in media if m.get("status") == "ready"])
+    frame_count = _state_frame_count(state)
+    colmap_ready = bool(state.get("colmap_prepared", False))
+    splat_name = str(state.get("splat_name", ""))
+    lines = [
+        "### Workflow Status",
+        f"- Session: {'Ready (' + splat_name + ')' if initialized else 'Not created'}",
+        f"- Media queued: {ready_media}",
+        f"- Frames extracted: {frame_count}",
+        f"- COLMAP dataset: {'Ready' if colmap_ready else 'Not prepared'}",
+    ]
+    return "\n".join(lines)
+
+
+def _next_action_hint(state: dict[str, Any]) -> str:
+    initialized = bool(state.get("initialized"))
+    media = state.get("media", [])
+    ready_media = len([m for m in media if m.get("status") == "ready"])
+    frame_count = _state_frame_count(state)
+    colmap_ready = bool(state.get("colmap_prepared", False))
+    if not initialized:
+        return "### Next Action\nCreate a session in Step 1."
+    if ready_media == 0:
+        return "### Next Action\nAdd one or more videos in Step 2."
+    if frame_count == 0:
+        return "### Next Action\nRun extraction in Step 3."
+    if not colmap_ready:
+        return "### Next Action\nReview frames (optional), then build COLMAP dataset in Step 5."
+    return "### Next Action\nDataset is ready. Switch to the Train Splat tab."
+
+
+def _workflow_ui_updates(state: dict[str, Any]):
+    initialized = bool(state.get("initialized"))
+    ready_media = len([m for m in state.get("media", []) if m.get("status") == "ready"])
+    frame_count = _state_frame_count(state)
+    return (
+        gr.update(value=_workflow_summary(state)),
+        gr.update(value=_next_action_hint(state)),
+        gr.update(visible=initialized),
+        gr.update(visible=initialized),
+        gr.update(visible=initialized and (ready_media > 0)),
+        gr.update(visible=initialized and (frame_count > 0)),
+    )
+
+
 def on_fps_changed(fps: float, state: dict[str, Any]):
     if not state.get("initialized"):
         return state, gr.update(value="No media loaded."), gr.update(interactive=False)
@@ -582,68 +640,86 @@ settings = _load_settings()
 HAS_COLMAP = _find_colmap_executable() is not None
 
 with gr.Blocks(title="Splatter Stills Extractor V2") as demo:
-    gr.Markdown("## Splatter Stills Extractor V2")
+    gr.Markdown("## Splatter Stills Extractor")
+    gr.Markdown("Follow the workflow from top to bottom: create session, add media, extract, review, then build COLMAP.")
     state = gr.State({"initialized": False, "media": []})
-
     with gr.Row():
-        splat_name = gr.Textbox(label="Splat name (must be unique)", placeholder="my_splat")
-        initialize_button = gr.Button("Initialize Splat", variant="primary")
+        with gr.Column(scale=2):
+            with gr.Group():
+                gr.Markdown("### Step 1 - Create Session")
+                with gr.Row():
+                    splat_name = gr.Textbox(label="Splat name (must be unique)", placeholder="my_splat")
+                    initialize_button = gr.Button("Create Session", variant="primary")
+                with gr.Row():
+                    base_output_dir = gr.Textbox(label="Base output directory", value=settings["base_output_dir"], scale=3)
+                    output_dir_preview = gr.Textbox(label="Stills output directory", value="", interactive=False, scale=2)
 
-    with gr.Row():
-        base_output_dir = gr.Textbox(label="Base output directory", value=settings["base_output_dir"], scale=3)
-        output_dir_preview = gr.Textbox(label="Stills output directory", value="", interactive=False, scale=2)
+            step2_group = gr.Group(visible=False)
+            with step2_group:
+                gr.Markdown("### Step 2 - Add Media")
+                with gr.Row():
+                    media_paths = gr.Textbox(
+                        label="Media paths (one per line) - preferred",
+                        placeholder="E:\\video1.mp4\nE:\\video2.mp4",
+                        lines=4,
+                        interactive=False,
+                        scale=2,
+                    )
+                    media_upload = gr.File(
+                        label="Or upload media files",
+                        file_count="multiple",
+                        file_types=["video"],
+                        type="filepath",
+                        interactive=False,
+                        scale=1,
+                    )
+                add_media_button = gr.Button("Add to Queue", interactive=False)
+                media_table = gr.Dataframe(
+                    headers=["path", "duration_sec", "start_sec", "end_sec", "status"],
+                    value=[],
+                    interactive=False,
+                    wrap=True,
+                    label="Source media queue",
+                )
 
-    with gr.Row():
-        fps = gr.Number(label="Images per second", value=float(settings["default_fps"]), precision=3, interactive=False)
-        max_width = gr.Number(
-            label="Max width (0 = original resolution)",
-            value=int(settings["default_max_width"]),
-            precision=0,
-            interactive=False,
-        )
+            step3_group = gr.Group(visible=False)
+            with step3_group:
+                gr.Markdown("### Step 3 - Extract Frames")
+                with gr.Row():
+                    fps = gr.Number(label="Images per second", value=float(settings["default_fps"]), precision=3, interactive=False)
+                    max_width = gr.Number(
+                        label="Max width (0 = original resolution)",
+                        value=int(settings["default_max_width"]),
+                        precision=0,
+                        interactive=False,
+                    )
+                generate_button = gr.Button("Extract Frames", variant="primary", interactive=False)
+                estimate = gr.Markdown("Add at least one video to continue.")
 
-    with gr.Row():
-        media_paths = gr.Textbox(
-            label="Media paths (one per line) - preferred",
-            placeholder="E:\\video1.mp4\nE:\\video2.mp4",
-            lines=4,
-            interactive=False,
-            scale=2,
-        )
-        media_upload = gr.File(
-            label="Or upload media files",
-            file_count="multiple",
-            file_types=["video"],
-            type="filepath",
-            interactive=False,
-            scale=1,
-        )
+            step4_group = gr.Group(visible=False)
+            with step4_group:
+                gr.Markdown("### Step 4 - Review and Curate")
+                with gr.Row():
+                    refresh_frames_button = gr.Button("Refresh Frames", interactive=False)
+                    reject_button = gr.Button("Reject Selected Frames", interactive=False)
+                frame_gallery = gr.Gallery(label="Extracted frames", columns=6, height=320)
+                frame_selector = gr.CheckboxGroup(label="Select frames to reject", choices=[], value=[])
 
-    with gr.Row():
-        add_media_button = gr.Button("Add Media", interactive=False)
-        generate_button = gr.Button("Generate Stills", variant="primary", interactive=False)
+            step5_group = gr.Group(visible=False)
+            with step5_group:
+                gr.Markdown("### Step 5 - Build COLMAP Dataset")
+                prepare_colmap_button = gr.Button("Build COLMAP Dataset", interactive=False)
 
-    estimate = gr.Markdown("No media loaded.")
-    media_table = gr.Dataframe(
-        headers=["path", "duration_sec", "start_sec", "end_sec", "status"],
-        value=[],
-        interactive=False,
-        wrap=True,
-        label="Source media queue",
-    )
+        with gr.Column(scale=1):
+            workflow_status = gr.Markdown(_workflow_summary({"initialized": False, "media": []}))
+            next_action = gr.Markdown(_next_action_hint({"initialized": False, "media": []}))
 
-    with gr.Row():
-        refresh_frames_button = gr.Button("Refresh Frames", interactive=False)
-        reject_button = gr.Button("Reject Selected Frames", interactive=False)
-        prepare_colmap_button = gr.Button("Prepare COLMAP Dataset", interactive=False)
     initial_colmap_msg = (
         "COLMAP status: Ready to run."
         if HAS_COLMAP
         else "COLMAP status: `colmap` not found in PATH. Install COLMAP to enable preparation."
     )
     colmap_status = gr.Markdown(initial_colmap_msg)
-    frame_gallery = gr.Gallery(label="Extracted frames", columns=6, height=320)
-    frame_selector = gr.CheckboxGroup(label="Select frames to reject", choices=[], value=[])
     log_output = gr.Code(label="Execution Console", value="", language="shell", lines=16, interactive=False)
 
     initialize_button.click(
@@ -668,41 +744,69 @@ with gr.Blocks(title="Splatter Stills Extractor V2") as demo:
     ).then(
         fn=lambda: (gr.update(interactive=True), gr.update(interactive=HAS_COLMAP)),
         outputs=[reject_button, prepare_colmap_button],
+    ).then(
+        fn=_workflow_ui_updates,
+        inputs=[state],
+        outputs=[workflow_status, next_action, step2_group, step3_group, step4_group, step5_group],
     )
 
     add_media_button.click(
         fn=add_media,
         inputs=[media_paths, media_upload, fps, state, log_output],
         outputs=[log_output, state, media_table, estimate, generate_button, media_paths],
+    ).then(
+        fn=_workflow_ui_updates,
+        inputs=[state],
+        outputs=[workflow_status, next_action, step2_group, step3_group, step4_group, step5_group],
     )
 
     fps.change(
         fn=on_fps_changed,
         inputs=[fps, state],
         outputs=[state, estimate, generate_button],
+    ).then(
+        fn=_workflow_ui_updates,
+        inputs=[state],
+        outputs=[workflow_status, next_action, step2_group, step3_group, step4_group, step5_group],
     )
 
     generate_button.click(
         fn=generate_stills,
         inputs=[fps, max_width, state, log_output],
         outputs=[log_output, state, frame_gallery, frame_selector, estimate],
+    ).then(
+        fn=_workflow_ui_updates,
+        inputs=[state],
+        outputs=[workflow_status, next_action, step2_group, step3_group, step4_group, step5_group],
     )
 
     refresh_frames_button.click(
         fn=refresh_frames,
         inputs=[state, log_output],
         outputs=[log_output, frame_gallery, frame_selector],
+    ).then(
+        fn=_workflow_ui_updates,
+        inputs=[state],
+        outputs=[workflow_status, next_action, step2_group, step3_group, step4_group, step5_group],
     )
 
     reject_button.click(
         fn=reject_selected_frames,
         inputs=[frame_selector, state, log_output],
         outputs=[log_output, frame_gallery, frame_selector],
+    ).then(
+        fn=_workflow_ui_updates,
+        inputs=[state],
+        outputs=[workflow_status, next_action, step2_group, step3_group, step4_group, step5_group],
     )
     prepare_colmap_button.click(
         fn=prepare_colmap_dataset,
         inputs=[state, log_output],
         outputs=[log_output, state, colmap_status],
+    ).then(
+        fn=_workflow_ui_updates,
+        inputs=[state],
+        outputs=[workflow_status, next_action, step2_group, step3_group, step4_group, step5_group],
     )
 
 
