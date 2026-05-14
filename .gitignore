@@ -18,6 +18,8 @@ ENV/
 # IDE / OS
 .idea/
 .vscode/
+# Nested copy from recovery / other workspace (not part of this repo)
+CursorProjects/
 *.swp
 Thumbs.db
 .DS_Store
