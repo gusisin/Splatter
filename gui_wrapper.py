@@ -14,7 +14,8 @@ from typing import Any
 import gradio as gr
 
 WRAPPER_DIR = Path(__file__).resolve().parent
-DEFAULT_REPO_DIR = Path(r"C:\Users\GusFr\3dgrut")
+# Match install.ps1: clone nv-tlabs/3dgrut into tools/3dgrut and run install_env_uv.ps1 there.
+DEFAULT_REPO_DIR = WRAPPER_DIR / "tools" / "3dgrut"
 PRESETS_FILE = WRAPPER_DIR / "gui_presets.json"
 PROCESS_LOCK = threading.Lock()
 MAX_LOG_CHARS = 200_000
@@ -211,6 +212,42 @@ def _repo_paths(repo_dir: str) -> tuple[Path, Path]:
     return root, root / "train.py"
 
 
+def _repo_venv_python(repo_root: Path) -> Path | None:
+    """Python inside the 3DGRUT repo venv (install_env_uv.ps1 creates .venv here)."""
+    if sys.platform == "win32":
+        candidate = repo_root / ".venv" / "Scripts" / "python.exe"
+    else:
+        candidate = repo_root / ".venv" / "bin" / "python"
+    return candidate if candidate.is_file() else None
+
+
+def _find_msvc_cl_path() -> Path | None:
+    """Locate MSVC's cl.exe the same way 3DGRUT's jit.py does, plus PATH.
+
+    Returns the directory containing cl.exe (suitable for prepending to PATH),
+    or None if no MSVC installation can be found. Mirrors the search used in
+    threedgrut/utils/jit.py so we fail loud and early instead of partway
+    through Initialize Model.
+    """
+    if sys.platform != "win32":
+        return None
+    on_path = shutil.which("cl.exe")
+    if on_path:
+        return Path(on_path).parent
+    import glob
+
+    for arch in (" (x86)", ""):
+        for edition in ("Enterprise", "Professional", "BuildTools", "Community"):
+            pattern = (
+                rf"C:\Program Files{arch}\Microsoft Visual Studio\*"
+                rf"\{edition}\VC\Tools\MSVC\*\bin\Hostx64\x64"
+            )
+            hits = sorted(glob.glob(pattern), reverse=True)
+            if hits:
+                return Path(hits[0])
+    return None
+
+
 def _query_gpus() -> list[dict[str, Any]]:
     if shutil.which("nvidia-smi") is None:
         return []
@@ -304,12 +341,13 @@ def _build_command(
     export_usdz: bool,
     conda_env: str,
 ) -> list[str]:
-    _, train_script = _repo_paths(repo_dir)
+    repo_root, train_script = _repo_paths(repo_dir)
     command: list[str] = []
     if conda_env.strip():
         command.extend(["conda", "run", "-n", conda_env.strip(), "python"])
     else:
-        command.append(sys.executable)
+        venv_py = _repo_venv_python(repo_root)
+        command.append(str(venv_py if venv_py is not None else sys.executable))
 
     command.extend(
         [
@@ -337,12 +375,40 @@ def _validate_inputs(
     config_name: str,
     out_dir: str,
     resume_checkpoint: str,
+    conda_env: str,
 ) -> str | None:
     repo_root, train_script = _repo_paths(repo_dir)
     if not repo_root.exists():
         return f"Repository directory not found: {repo_root}"
     if not train_script.exists():
         return f"Missing train script: {train_script}"
+
+    if not conda_env.strip():
+        if _repo_venv_python(repo_root) is None:
+            hint = (
+                f"{repo_root / '.venv' / 'Scripts' / 'python.exe'}"
+                if sys.platform == "win32"
+                else f"{repo_root / '.venv' / 'bin' / 'python'}"
+            )
+            return (
+                "No 3DGRUT virtualenv Python found. Training needs Hydra, Torch, and the rest of the "
+                "3DGRUT stack inside that repo's .venv (not the Splatter UI venv).\n"
+                f"Expected: {hint}\n"
+                "Fix: run Splatter's install.ps1, or from the 3DGRUT repo run install_env_uv.ps1. "
+                "Alternatively, set the Conda environment field so the launcher uses "
+                "`conda run -n <your_env> python ...`."
+            )
+
+    if sys.platform == "win32" and _find_msvc_cl_path() is None:
+        return (
+            "Could not locate a Microsoft Visual C++ compiler (cl.exe). 3DGRUT JIT-compiles CUDA/C++ "
+            "kernels on first run and needs MSVC available on PATH or under "
+            r"`C:\Program Files\Microsoft Visual Studio\<year>\<edition>\VC\Tools\MSVC\...`.\n"
+            "Fix: install 'Build Tools for Visual Studio 2022' with the 'Desktop development with C++' workload, e.g.:\n"
+            "    winget install --id Microsoft.VisualStudio.2022.BuildTools -e --override \""
+            "--add Microsoft.VisualStudio.Workload.VCTools --includeRecommended --quiet --norestart\"\n"
+            "Then start a fresh PowerShell and relaunch Splatter."
+        )
 
     candidate = Path(data_path).expanduser()
     if not candidate.exists():
@@ -461,7 +527,9 @@ def start_training(
             )
             return
 
-        error = _validate_inputs(repo_dir, data_path, mode, config_name, out_dir, resume_checkpoint)
+        error = _validate_inputs(
+            repo_dir, data_path, mode, config_name, out_dir, resume_checkpoint, conda_env
+        )
         if error:
             yield f"[ERROR] {error}\n", run_state, gr.update(interactive=True), gr.update(interactive=False)
             return
@@ -482,6 +550,51 @@ def start_training(
             )
             return
 
+        # If the requested downsample > 1 and the COLMAP dataset is missing the
+        # corresponding `images_<N>/` pyramid (older datasets built before
+        # Splatter generated them at COLMAP time), generate it on the fly so
+        # training doesn't fail with "Image not found. Cannot determine
+        # dimensions for intrinsic ID".
+        is_colmap_style = any(token in config_name for token in ("colmap", "cusfm"))
+        pyramid_msg = ""
+        if is_colmap_style and int(downsample) > 1:
+            dataset_root = Path(resolved_data_path).expanduser()
+            images_root = dataset_root / "images"
+            target_dir = dataset_root / f"images_{int(downsample)}"
+            need_build = False
+            if not images_root.exists():
+                pyramid_msg = (
+                    f"[WARN] Missing source images at {images_root}; cannot pre-generate images_{int(downsample)}/.\n"
+                )
+            else:
+                expected = {p.name for p in images_root.iterdir() if p.is_file()}
+                existing = (
+                    {p.name for p in target_dir.iterdir() if p.is_file()}
+                    if target_dir.exists()
+                    else set()
+                )
+                if not expected.issubset(existing):
+                    need_build = True
+            if need_build:
+                try:
+                    from stills_extractor_app import _generate_downscaled_images
+
+                    counts, gen_log = _generate_downscaled_images(
+                        images_root, dataset_root, factors=(int(downsample),)
+                    )
+                    pyramid_msg = (
+                        f"[INFO] Pre-generated {target_dir.name}/ for this run "
+                        f"(downsample={int(downsample)}, images={counts.get(int(downsample), 0)}).\n"
+                    )
+                    if gen_log:
+                        pyramid_msg += gen_log
+                except Exception as exc:
+                    pyramid_msg = (
+                        f"[WARN] Failed to auto-generate {target_dir.name}/: {exc}. "
+                        "Training will likely fail with 'Image not found' errors. "
+                        "Workarounds: set Downsample factor=1, or rerun Build COLMAP Dataset.\n"
+                    )
+
         repo_root, _ = _repo_paths(repo_dir)
         command = _build_command(
             repo_dir=repo_dir,
@@ -499,6 +612,23 @@ def start_training(
         command_preview = " ".join(shlex.quote(part) for part in command)
         selected_gpu, gpu_message = _resolve_gpu_selection(gpu_selection)
         launch_env = os.environ.copy()
+        # Force the child Python to emit UTF-8 on stdout/stderr so emoji from
+        # 3DGRUT's rich logger don't crash on legacy Windows cp1252 consoles.
+        # Our reader thread already decodes the pipe as UTF-8.
+        launch_env["PYTHONIOENCODING"] = "utf-8"
+        launch_env["PYTHONUTF8"] = "1"
+        # Make the 3DGRUT venv's Scripts/ (or bin/) directory visible on PATH so
+        # JIT kernel compilation can find tools like slangc.exe that
+        # install_env_uv.ps1 placed there. Without this, the child sees only the
+        # parent shell's PATH and `subprocess.Popen('slangc', ...)` raises
+        # FileNotFoundError partway through Initialize Model.
+        repo_python = _repo_venv_python(repo_root)
+        if repo_python is not None:
+            scripts_dir = str(repo_python.parent)
+            launch_env["PATH"] = scripts_dir + os.pathsep + launch_env.get("PATH", "")
+        msvc_dir = _find_msvc_cl_path()
+        if msvc_dir is not None:
+            launch_env["PATH"] = str(msvc_dir) + os.pathsep + launch_env.get("PATH", "")
         if selected_gpu is not None:
             launch_env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
             launch_env["CUDA_VISIBLE_DEVICES"] = selected_gpu
@@ -534,7 +664,7 @@ def start_training(
     resolved_info = f"[INFO] Using data_path: {resolved_data_path}\n"
     debug_info = _colmap_path_debug(resolved_data_path) if any(token in config_name for token in ("colmap", "cusfm")) else ""
     info_prefix = f"{data_path_info}\n" if data_path_info else ""
-    log_text = f"{info_prefix}{gpu_message}\n$ {command_preview}\n\n"
+    log_text = f"{info_prefix}{pyramid_msg}{gpu_message}\n$ {command_preview}\n\n"
     log_text = f"{resolved_info}{debug_info}\n{log_text}"
     yield log_text, run_state, gr.update(interactive=False), gr.update(interactive=True)
     while True:

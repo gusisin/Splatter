@@ -173,8 +173,68 @@ if (-not (Get-Command "ffmpeg" -ErrorAction SilentlyContinue)) {
     Write-Warn "Install recommendation (one-time):"
     Write-Warn "  choco install ffmpeg -y   # if you use Chocolatey"
 }
+if (-not (Get-Command "ffprobe" -ErrorAction SilentlyContinue)) {
+    Write-Warn "ffprobe not found on PATH. Video duration probing will fall back to defaults."
+}
 
-### 7. Summary
+### 7. (Optional) Check COLMAP
+
+Write-Info "Checking for COLMAP..."
+if (-not (Get-Command "colmap" -ErrorAction SilentlyContinue)) {
+    Write-Warn "colmap not found on PATH. The 'Build COLMAP Dataset' step will fail until COLMAP is installed."
+    Write-Warn "Install recommendation (one-time):"
+    Write-Warn "  Download the Windows binaries from https://colmap.github.io/install.html"
+    Write-Warn "  and add the extracted folder to your PATH."
+}
+
+### 8. Ensure MSVC C++ Build Tools (required by 3DGRUT JIT kernels)
+
+function Find-MsvcCl {
+    if (Get-Command "cl.exe" -ErrorAction SilentlyContinue) { return $true }
+    $patterns = @(
+        "C:\Program Files\Microsoft Visual Studio\*\BuildTools\VC\Tools\MSVC\*\bin\Hostx64\x64\cl.exe",
+        "C:\Program Files\Microsoft Visual Studio\*\Community\VC\Tools\MSVC\*\bin\Hostx64\x64\cl.exe",
+        "C:\Program Files\Microsoft Visual Studio\*\Professional\VC\Tools\MSVC\*\bin\Hostx64\x64\cl.exe",
+        "C:\Program Files\Microsoft Visual Studio\*\Enterprise\VC\Tools\MSVC\*\bin\Hostx64\x64\cl.exe",
+        "C:\Program Files (x86)\Microsoft Visual Studio\*\BuildTools\VC\Tools\MSVC\*\bin\Hostx64\x64\cl.exe"
+    )
+    foreach ($p in $patterns) {
+        if (Get-ChildItem -Path $p -ErrorAction SilentlyContinue) { return $true }
+    }
+    return $false
+}
+
+Write-Info "Checking for Microsoft Visual C++ compiler (cl.exe)..."
+if (Find-MsvcCl) {
+    Write-Info "  MSVC C++ Build Tools detected."
+} else {
+    Write-Info "  MSVC C++ Build Tools not detected. 3DGRUT requires them for JIT kernel compilation."
+    $winget = Get-Command "winget" -ErrorAction SilentlyContinue
+    if ($winget) {
+        Write-Info "Attempting to install via winget (will prompt for elevation if needed)..."
+        Write-Info "  Package : Microsoft.VisualStudio.2022.BuildTools"
+        Write-Info "  Workload: Microsoft.VisualStudio.Workload.VCTools (Desktop development with C++)"
+        & winget install --id Microsoft.VisualStudio.2022.BuildTools -e `
+            --accept-source-agreements --accept-package-agreements `
+            --override "--add Microsoft.VisualStudio.Workload.VCTools --includeRecommended --quiet --norestart"
+        if ($LASTEXITCODE -eq 0 -and (Find-MsvcCl)) {
+            Write-Info "  MSVC Build Tools installed successfully."
+        } else {
+            Write-Warn "winget exited with code $LASTEXITCODE and cl.exe still not found."
+            Write-Warn "Manual install: https://visualstudio.microsoft.com/downloads/"
+            Write-Warn "  Pick 'Build Tools for Visual Studio 2022' and the 'Desktop development with C++' workload."
+        }
+    } else {
+        Write-Warn "winget not available on this machine, cannot auto-install."
+        Write-Warn "Manual install (one-time, ~10 min):"
+        Write-Warn "  1. Download 'Build Tools for Visual Studio 2022' from"
+        Write-Warn "     https://visualstudio.microsoft.com/downloads/"
+        Write-Warn "  2. In the installer, select 'Desktop development with C++' workload."
+        Write-Warn "  3. Open a fresh PowerShell and re-run install.ps1 to confirm detection."
+    }
+}
+
+### 9. Summary
 
 Write-Host ""
 Write-Host "================================ INSTALL COMPLETE ================================" -ForegroundColor Green
