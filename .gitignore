@@ -3,6 +3,8 @@ __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
+*.ply
+*.png
 .Python
 .pytest_cache/
 .mypy_cache/

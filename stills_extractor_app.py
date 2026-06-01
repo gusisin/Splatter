@@ -7,21 +7,35 @@ import os
 import re
 import shlex
 import shutil
+import struct
 import subprocess
 import sys
+import threading
 import time
 import traceback
+import queue
 from pathlib import Path
 from typing import Any
 
 import gradio as gr
 from PIL import Image
 
+try:
+    import plotly.graph_objects as go
+
+    HAS_PLOTLY = True
+except ImportError:
+    go = None  # type: ignore[assignment,misc]
+    HAS_PLOTLY = False
+
 APP_DIR = Path(__file__).resolve().parent
 SETTINGS_FILE = APP_DIR / "stills_app_settings.json"
 MAX_LOG_CHARS = 250_000
 DEFAULT_BASE_DIR = Path.home() / "Pictures" / "Splatter"
 GALLERY_CACHE_DIR = APP_DIR / "_stills_gallery_cache"
+COLMAP_VIEWER_MAX_POINTS = 8_000
+COLMAP_MAPPER_SNAPSHOT_FREQ = 5
+COLMAP_VIEWER_REFRESH_SEC = 3.0
 
 logger = logging.getLogger("splatter.stills")
 logger.propagate = False
@@ -45,6 +59,27 @@ def _console(msg: str, level: str = "INFO") -> None:
 
 MAX_GALLERY_FRAMES = 400
 GALLERY_THUMB_MAX = 512
+
+# Equirectangular source → 6 cubemap pinhole faces for COLMAP (90° FOV each, full sphere).
+EQUIRECT_FACE_FOV_DEG = 90
+EQUIRECT_CUBE_FACES: tuple[tuple[str, int, int], ...] = (
+    ("f", 0, 0),      # front
+    ("r", 90, 0),     # right
+    ("b", 180, 0),    # back
+    ("l", -90, 0),    # left (yaw=270 fails in ffmpeg v360 — use -90)
+    ("u", 0, 90),     # up / zenith (ffmpeg v360 pitch sign is opposite naive expectation)
+    ("d", 0, -90),    # down / nadir
+)
+CUBE_FACE_NAMES = {
+    "f": "front",
+    "r": "right",
+    "b": "back",
+    "l": "left",
+    "u": "up",
+    "d": "down",
+}
+# Full-res v360 faces from 8K equirect are huge; default cap when UI max_width=0.
+EQUIRECT_DEFAULT_TILE_MAX_WIDTH = 1920
 
 
 def _gallery_items_from_frames(frames: list[Path]) -> list[Any]:
@@ -230,6 +265,347 @@ def _probe_duration_seconds(path: Path) -> float:
     return float(result.stdout.strip())
 
 
+def _equirect_cube_face_jobs() -> list[tuple[str, int, int, str]]:
+    return [(face, yaw, pitch, f"_{face}.png") for face, yaw, pitch in EQUIRECT_CUBE_FACES]
+
+
+def _equirect_faces_per_frame() -> int:
+    return len(EQUIRECT_CUBE_FACES)
+
+
+def _is_equirect_projection(projection: dict[str, Any]) -> bool:
+    mode = str(projection.get("mode", ""))
+    return mode in ("equirectangular_cubemap", "equirectangular_tiles")
+
+
+def _default_projection_block(equirect: bool = False, detection: str = "manual") -> dict[str, Any]:
+    if not equirect:
+        return {"mode": "flat"}
+    return {
+        "mode": "equirectangular_cubemap",
+        "detection": detection,
+        "face_fov_deg": EQUIRECT_FACE_FOV_DEG,
+        "faces": [face for face, _, _ in EQUIRECT_CUBE_FACES],
+        "faces_per_equirect_frame": _equirect_faces_per_frame(),
+    }
+
+
+def _projection_detection_from_media(media: list[dict[str, Any]]) -> str:
+    hints: set[str] = set()
+    for item in media:
+        for h in item.get("projection_hints") or []:
+            hints.add(str(h))
+    if "spherical_metadata" in hints:
+        return "ffprobe_spherical"
+    if "aspect_ratio_2_1" in hints:
+        return "aspect_ratio_2_1"
+    return "manual"
+
+
+def _probe_video_stream_info(path: Path) -> dict[str, Any]:
+    """Probe width/height and heuristics for equirectangular 360 content."""
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-print_format",
+        "json",
+        "-show_streams",
+        "-show_format",
+        str(path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    info: dict[str, Any] = {
+        "width": 0,
+        "height": 0,
+        "aspect": 0.0,
+        "hints": [],
+        "suggestion": "flat",
+    }
+    if result.returncode != 0:
+        return info
+    try:
+        payload = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError:
+        return info
+
+    video_stream: dict[str, Any] | None = None
+    for stream in payload.get("streams") or []:
+        if isinstance(stream, dict) and stream.get("codec_type") == "video":
+            video_stream = stream
+            break
+    if video_stream is None:
+        return info
+
+    width = int(video_stream.get("width") or 0)
+    height = int(video_stream.get("height") or 0)
+    info["width"] = width
+    info["height"] = height
+    info["aspect"] = (width / height) if height > 0 else 0.0
+
+    hints: list[str] = []
+    blob = json.dumps(payload).lower()
+    if any(token in blob for token in ("spherical", "equirect", "360", "projection= equirect")):
+        hints.append("spherical_metadata")
+
+    side_data = video_stream.get("side_data_list") or []
+    if isinstance(side_data, list):
+        for entry in side_data:
+            if isinstance(entry, dict):
+                sd_type = str(entry.get("side_data_type") or entry.get("type") or "").lower()
+                if "spherical" in sd_type or "360" in sd_type:
+                    hints.append("spherical_metadata")
+
+    if 1.85 <= info["aspect"] <= 2.15:
+        hints.append("aspect_ratio_2_1")
+
+    info["hints"] = sorted(set(hints))
+    if "spherical_metadata" in info["hints"] or (
+        "aspect_ratio_2_1" in info["hints"] and info["aspect"] >= 1.95
+    ):
+        info["suggestion"] = "equirect"
+    return info
+
+
+def _equirect_hint_markdown(media: list[dict[str, Any]]) -> tuple[bool, str]:
+    flagged = [m for m in media if m.get("projection_suggestion") == "equirect"]
+    if not flagged:
+        return False, ""
+    names = ", ".join(Path(m["path"]).name for m in flagged[:4])
+    extra = f" (+{len(flagged) - 4} more)" if len(flagged) > 4 else ""
+    return True, (
+        f"**360 hint:** ffprobe suggests **stitched equirectangular** for "
+        f"{len(flagged)} queued file(s) ({names}{extra}). "
+        "Enable **Stitched equirectangular (360°) → 6 cubemap faces** in Step 3 before extracting."
+    )
+
+
+def _effective_equirect_max_width(max_width: int) -> int:
+    w = int(max_width)
+    return w if w > 0 else EQUIRECT_DEFAULT_TILE_MAX_WIDTH
+
+
+def _normalize_v360_angle(deg: int) -> int:
+    """ffmpeg v360 accepts yaw/pitch in [-180, 180]; 270 must be written as -90."""
+    d = int(deg) % 360
+    if d > 180:
+        d -= 360
+    return d
+
+
+def _build_flat_vf(fps: float, max_width: int) -> str:
+    vf = f"fps={fps}"
+    if int(max_width) > 0:
+        vf = f"{vf},scale='min({int(max_width)},iw)':-2"
+    return vf
+
+
+def _build_equirect_tile_vf(fps: float, yaw: int, pitch: int, max_width: int) -> str:
+    h_fov = EQUIRECT_FACE_FOV_DEG
+    tile_w = _effective_equirect_max_width(max_width)
+    yaw = _normalize_v360_angle(yaw)
+    pitch = _normalize_v360_angle(pitch)
+    vf = (
+        f"fps={fps},"
+        f"v360=input=equirect:output=rectilinear:yaw={yaw}:pitch={pitch}:roll=0:"
+        f"ih_fov=360:iv_fov=180:h_fov={h_fov}:v_fov={h_fov},"
+        f"scale='min({tile_w},iw)':-2"
+    )
+    return vf
+
+
+def _ffmpeg_extract_to_pattern(
+    src: Path,
+    pattern: Path,
+    vf: str,
+    start_sec: float,
+    trim_sec: float | None,
+    start_number: int,
+) -> tuple[int, str]:
+    cmd: list[str] = ["ffmpeg", "-y"]
+    if start_sec > 0.0:
+        cmd.extend(["-ss", f"{start_sec:.3f}"])
+    cmd.extend(["-i", str(src)])
+    if trim_sec is not None and trim_sec > 0.0:
+        cmd.extend(["-t", f"{trim_sec:.3f}"])
+    cmd.extend(["-vf", vf, "-an", "-start_number", str(start_number), str(pattern)])
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    output = (result.stdout or "") + (result.stderr or "")
+    code = int(result.returncode)
+    if code != 0 and code > 255:
+        code = int.from_bytes(code.to_bytes(4, "little", signed=False), "little", signed=True)
+    return code, output
+
+
+def _is_gradio_temp_path(path: Path) -> bool:
+    lowered = [part.lower() for part in path.parts]
+    return "gradio" in lowered or ("temp" in lowered and "appdata" in lowered)
+
+
+def _is_file_lock_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    if "being used by another process" in msg or "permission denied" in msg:
+        return True
+    winerr = getattr(exc, "winerror", None)
+    return winerr in (5, 32)
+
+
+def _windows_shared_read_copy(src: Path, dest: Path) -> bool:
+    """Best-effort copy while Gradio still has the temp file open (Windows only)."""
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.windll.kernel32
+        GENERIC_READ = 0x80000000
+        FILE_SHARE_READ = 0x00000001
+        FILE_SHARE_WRITE = 0x00000002
+        FILE_SHARE_DELETE = 0x00000004
+        OPEN_EXISTING = 3
+        INVALID_HANDLE_VALUE = -1
+
+        handle = kernel32.CreateFileW(
+            str(src),
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            0,
+            None,
+        )
+        if handle == INVALID_HANDLE_VALUE:
+            return False
+
+        chunks: list[bytes] = []
+        buf = ctypes.create_string_buffer(1024 * 1024)
+        bytes_read = wintypes.DWORD(0)
+        while True:
+            ok = kernel32.ReadFile(handle, buf, len(buf), ctypes.byref(bytes_read), None)
+            if not ok:
+                break
+            n = int(bytes_read.value)
+            if n <= 0:
+                break
+            chunks.append(buf.raw[:n])
+        kernel32.CloseHandle(handle)
+        dest.write_bytes(b"".join(chunks))
+        return dest.is_file() and dest.stat().st_size > 0
+    except OSError:
+        return False
+    except Exception:
+        return False
+
+
+def _copy_file_resilient(src: Path, dest: Path) -> None:
+    last_err: Exception | None = None
+    for attempt in range(20):
+        try:
+            shutil.copy2(src, dest)
+            return
+        except OSError as exc:
+            last_err = exc
+            if not _is_file_lock_error(exc):
+                raise
+            time.sleep(0.2 + 0.1 * attempt)
+
+    for attempt in range(10):
+        try:
+            with src.open("rb") as inf:
+                dest.write_bytes(inf.read())
+            if dest.is_file() and dest.stat().st_size > 0:
+                return
+        except OSError as exc:
+            last_err = exc
+            if not _is_file_lock_error(exc):
+                raise
+            time.sleep(0.25 + 0.15 * attempt)
+
+    if _windows_shared_read_copy(src, dest):
+        return
+
+    raise OSError(f"Could not copy media into session source folder: {last_err}") from last_err
+
+
+def _stage_media_file(src: Path, splat_dir: Path) -> Path:
+    """Copy browser uploads into the session so ffprobe/ffmpeg are not blocked by Gradio temp locks."""
+    src = src.expanduser().resolve()
+    source_dir = (splat_dir / "source").resolve()
+    source_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        src.relative_to(source_dir)
+        return src
+    except ValueError:
+        pass
+
+    dest = source_dir / src.name
+    counter = 1
+    while dest.exists():
+        dest = source_dir / f"{src.stem}_{counter}{src.suffix}"
+        counter += 1
+
+    if src.is_file() and dest.is_file() and src.stat().st_size == dest.stat().st_size:
+        return dest
+
+    _copy_file_resilient(src, dest)
+    return dest
+
+
+def _resolve_staged_media_path(raw_path: str, state: dict[str, Any]) -> Path:
+    splat_dir = Path(state["splat_dir"])
+    p = Path(raw_path).expanduser().resolve()
+    staged_map = state.get("staged_sources") or {}
+    key = str(p)
+    if key in staged_map:
+        candidate = Path(staged_map[key]).expanduser()
+        if candidate.is_file():
+            return candidate.resolve()
+    return _stage_media_file(p, splat_dir)
+
+
+def _local_path_queue_button(local_path: str, upload_value: Any, state: dict[str, Any]):
+    if not state.get("initialized"):
+        return gr.update(interactive=False, variant="secondary")
+    local = (local_path or "").strip().strip('"')
+    has_local = bool(local) and Path(local).expanduser().is_file()
+    has_upload = bool(_extract_file_paths(upload_value))
+    if has_local or has_upload:
+        return gr.update(interactive=True, variant="primary")
+    return gr.update(interactive=False, variant="secondary")
+
+
+def _on_media_upload_changed(upload_value: Any, state: dict[str, Any]):
+    """Enable Add to Queue when files are selected (staging happens on button click)."""
+    if not (state or {}).get("initialized"):
+        return gr.update(interactive=False, variant="secondary"), gr.update(value="")
+    has_files = bool(_extract_file_paths(upload_value))
+    btn = gr.update(interactive=has_files, variant="primary" if has_files else "secondary")
+    status = (
+        "_Upload ready — click **Add to Queue** to copy into the session `source` folder._"
+        if has_files
+        else ""
+    )
+    return btn, gr.update(value=status)
+
+
+def _probe_media_metadata(path: Path) -> tuple[float, dict[str, Any]]:
+    """Probe duration + stream info, retrying when Windows/Gradio briefly locks the file."""
+    last_exc: Exception | None = None
+    for attempt in range(10):
+        try:
+            duration = _probe_duration_seconds(path)
+            stream_info = _probe_video_stream_info(path)
+            return duration, stream_info
+        except (RuntimeError, OSError, ValueError) as exc:
+            last_exc = exc
+            if _is_file_lock_error(exc):
+                time.sleep(0.25 + 0.15 * attempt)
+                continue
+            raise
+    raise RuntimeError(str(last_exc) if last_exc else "ffprobe failed")
+
+
 def _extract_file_paths(file_value: Any) -> list[str]:
     if file_value is None:
         return []
@@ -289,13 +665,20 @@ def _queue_summary_text(media: list[dict[str, Any]]) -> str:
     return f"**Queue: {n} video(s) ready.**"
 
 
-def _add_to_queue_update(upload_value: Any, state: dict[str, Any]):
-    """Highlight the Add to Queue button in primary colour when uploads are pending."""
-    if not (state or {}).get("initialized"):
-        return gr.update(interactive=False, variant="secondary")
-    if _extract_file_paths(upload_value):
-        return gr.update(interactive=True, variant="primary")
-    return gr.update(interactive=False, variant="secondary")
+def _collect_media_candidates(uploaded_files: Any, local_path: str = "") -> list[str]:
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for raw in _extract_file_paths(uploaded_files):
+        path = str(Path(raw).expanduser())
+        if path not in seen:
+            seen.add(path)
+            candidates.append(path)
+    local = (local_path or "").strip().strip('"')
+    if local:
+        path = str(Path(local).expanduser())
+        if path not in seen:
+            candidates.append(path)
+    return candidates
 
 
 def _trimmed_duration(m: dict[str, Any]) -> float:
@@ -369,15 +752,20 @@ def _format_seconds(secs: float) -> str:
     return f"~{hours:.2f} h"
 
 
-def _estimate_summary(media: list[dict[str, Any]], fps: float, max_width: int = 0) -> str:
+def _estimate_summary(
+    media: list[dict[str, Any]], fps: float, max_width: int = 0, equirect_mode: bool = False
+) -> str:
     ready = [m for m in media if m.get("status") == "ready"]
     total_duration = sum(_trimmed_duration(m) for m in ready)
-    total_frames = sum(_estimate_frame_count(_trimmed_duration(m), fps) for m in ready)
+    samples = sum(_estimate_frame_count(_trimmed_duration(m), fps) for m in ready)
+    tiles = _equirect_faces_per_frame() if equirect_mode else 1
+    total_frames = samples * tiles
     if total_frames <= 0:
         return f"Estimated trimmed duration: **{total_duration:.2f}s** | Estimated stills: **0**"
 
     cal = _load_calibration()
-    bpf = cal["bytes_per_frame"] if cal["bytes_per_frame"] > 0 else _heuristic_bytes_per_frame(max_width)
+    est_width = _effective_equirect_max_width(max_width) if equirect_mode else int(max_width)
+    bpf = cal["bytes_per_frame"] if cal["bytes_per_frame"] > 0 else _heuristic_bytes_per_frame(est_width)
     spf = cal["seconds_per_frame"]
     size_str = _format_size(bpf * total_frames)
     if spf > 0:
@@ -386,9 +774,14 @@ def _estimate_summary(media: list[dict[str, Any]], fps: float, max_width: int = 
     else:
         time_block = ""
     cal_tag = " _(calibrated)_" if cal["bytes_per_frame"] > 0 or cal["seconds_per_frame"] > 0 else " _(rough)_"
+    tile_note = (
+        f" ({samples} equirect sample(s) × **{tiles}** cubemap faces @ {EQUIRECT_FACE_FOV_DEG}° FOV)"
+        if equirect_mode and samples > 0
+        else ""
+    )
     return (
         f"Estimated trimmed duration: **{total_duration:.2f}s** | "
-        f"≈ **{total_frames}** stills · ~**{size_str}**{time_block}{cal_tag}"
+        f"≈ **{total_frames}** stills{tile_note} · ~**{size_str}**{time_block}{cal_tag}"
     )
 
 
@@ -409,9 +802,18 @@ def _workflow_summary(state: dict[str, Any]) -> str:
     frame_count = _state_frame_count(state)
     colmap_ready = bool(state.get("colmap_prepared", False))
     splat_name = str(state.get("splat_name", ""))
+    projection = state.get("projection") or {"mode": "flat"}
+    proj_label = "flat video"
+    if _is_equirect_projection(projection):
+        faces = projection.get(
+            "faces_per_equirect_frame",
+            projection.get("tiles_per_equirect_frame", _equirect_faces_per_frame()),
+        )
+        proj_label = f"360 equirect → {faces} cubemap faces/sample"
     lines = [
         "### Workflow Status",
         f"- Session: {'Ready (' + splat_name + ')' if initialized else 'Not created'}",
+        f"- Source projection: {proj_label}",
         f"- Media queued: {ready_media}",
         f"- Frames extracted: {frame_count}",
         f"- COLMAP dataset: {'Ready' if colmap_ready else 'Not prepared'}",
@@ -432,8 +834,8 @@ def _next_action_hint(state: dict[str, Any]) -> str:
     if frame_count == 0:
         return "### Next Action\nRun extraction in Step 3."
     if not colmap_ready:
-        return "### Next Action\nReview frames (optional), then build COLMAP dataset in Step 5."
-    return "### Next Action\nDataset is ready. Switch to the Train Splat tab."
+        return "### Next Action\nReview frames (optional), then open the **Build COLMAP Dataset** tab."
+    return "### Next Action\nDataset is ready. Switch to the **Train Splat** tab."
 
 
 def _workflow_ui_updates(state: dict[str, Any]):
@@ -445,8 +847,367 @@ def _workflow_ui_updates(state: dict[str, Any]):
         gr.update(value=_next_action_hint(state)),
         gr.update(visible=initialized),
         gr.update(visible=initialized),
-        gr.update(visible=initialized and (ready_media > 0)),
         gr.update(visible=initialized and (frame_count > 0)),
+    )
+
+
+def _discover_splat_sessions(base_dir: str) -> list[str]:
+    base = Path(base_dir).expanduser()
+    if not base.exists():
+        return []
+    return sorted([p.name for p in base.iterdir() if p.is_dir() and (p / "manifest.json").exists()])
+
+
+def _sparse0_for_state(state: dict[str, Any]) -> Path | None:
+    if not state.get("initialized"):
+        return None
+    dataset = Path(str(state.get("dataset_path") or "")).expanduser()
+    if dataset.is_dir():
+        candidate = dataset / "sparse" / "0"
+        if candidate.is_dir():
+            return candidate
+    splat_dir = Path(str(state.get("splat_dir") or "")).expanduser()
+    candidate = splat_dir / "dataset" / "sparse" / "0"
+    return candidate if candidate.is_dir() else None
+
+
+def _read_colmap_points3d_xyz_rgb(model_dir: Path) -> tuple[list[tuple[float, float, float]], list[tuple[int, int, int]]] | None:
+    """Read XYZ + RGB from COLMAP points3D.bin (preferred) or points3D.txt."""
+    bin_path = model_dir / "points3D.bin"
+    if bin_path.is_file():
+        try:
+            data = bin_path.read_bytes()
+        except OSError:
+            return None
+        if len(data) < 8:
+            return None
+        offset = 0
+        (num_points,) = struct.unpack_from("<Q", data, offset)
+        offset += 8
+        xyz: list[tuple[float, float, float]] = []
+        rgb: list[tuple[int, int, int]] = []
+        for _ in range(num_points):
+            if offset + 8 + 24 + 3 + 8 + 8 > len(data):
+                break
+            offset += 8  # point3D_id
+            x, y, z = struct.unpack_from("<ddd", data, offset)
+            offset += 24
+            r, g, b = struct.unpack_from("<BBB", data, offset)
+            offset += 3
+            offset += 8  # error (double)
+            (track_len,) = struct.unpack_from("<Q", data, offset)
+            offset += 8
+            track_bytes = int(track_len) * 8
+            if offset + track_bytes > len(data):
+                break
+            offset += track_bytes
+            xyz.append((float(x), float(y), float(z)))
+            rgb.append((int(r), int(g), int(b)))
+        if xyz:
+            return xyz, rgb
+        return None
+
+    txt_path = model_dir / "points3D.txt"
+    if not txt_path.is_file():
+        return None
+    xyz = []
+    rgb = []
+    try:
+        with txt_path.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                parts = stripped.split()
+                if len(parts) < 8:
+                    continue
+                x, y, z = float(parts[1]), float(parts[2]), float(parts[3])
+                r, g, b = int(parts[4]), int(parts[5]), int(parts[6])
+                xyz.append((x, y, z))
+                rgb.append((r, g, b))
+    except OSError:
+        return None
+    return (xyz, rgb) if xyz else None
+
+
+def _subsample_colmap_points(
+    xyz: list[tuple[float, float, float]],
+    rgb: list[tuple[int, int, int]],
+    max_points: int,
+) -> tuple[list[tuple[float, float, float]], list[tuple[int, int, int]]]:
+    if len(xyz) <= max_points:
+        return xyz, rgb
+    stride = max(1, len(xyz) // max_points)
+    indices = list(range(0, len(xyz), stride))[:max_points]
+    return [xyz[i] for i in indices], [rgb[i] for i in indices]
+
+
+def _build_colmap_plotly_figure(
+    model_dir: Path,
+    *,
+    max_points: int = COLMAP_VIEWER_MAX_POINTS,
+) -> Any | None:
+    """Interactive 3D scatter for COLMAP points (reliable in-browser preview)."""
+    if not HAS_PLOTLY:
+        return None
+    parsed = _read_colmap_points3d_xyz_rgb(model_dir)
+    if not parsed:
+        return None
+    xyz, rgb = parsed
+    xyz, rgb = _subsample_colmap_points(xyz, rgb, max_points)
+    if not xyz:
+        return None
+
+    xs = [p[0] for p in xyz]
+    ys = [p[1] for p in xyz]
+    zs = [p[2] for p in xyz]
+    colors = [f"rgb({int(r)},{int(g)},{int(b)})" for r, g, b in rgb]
+
+    fig = go.Figure(
+        data=[
+            go.Scatter3d(
+                x=xs,
+                y=ys,
+                z=zs,
+                mode="markers",
+                marker=dict(size=1.8, color=colors, opacity=0.92),
+                hovertemplate="x=%{x:.2f}<br>y=%{y:.2f}<br>z=%{z:.2f}<extra></extra>",
+            )
+        ]
+    )
+    axis_style = dict(
+        title="",
+        showgrid=False,
+        zeroline=False,
+        showticklabels=False,
+        showline=False,
+        showbackground=False,
+        ticks="",
+    )
+    fig.update_layout(
+        template=None,
+        margin=dict(l=0, r=0, t=0, b=0),
+        paper_bgcolor="#000000",
+        plot_bgcolor="#000000",
+        height=560,
+        showlegend=False,
+        scene=dict(
+            bgcolor="#000000",
+            xaxis=axis_style,
+            yaxis=axis_style,
+            zaxis=axis_style,
+            aspectmode="data",
+        ),
+    )
+    _console(f"Viewer plot: {len(xyz)} points from {model_dir}")
+    return fig
+
+
+def _viewer_plot_update_for_sparse(model_dir: Path | None) -> Any:
+    hidden = gr.update(value=None, visible=False)
+    if model_dir is None:
+        return hidden
+    if not HAS_PLOTLY:
+        _console("plotly not installed — COLMAP 3D preview disabled (pip install plotly)", "WARNING")
+        return hidden
+    figure = _build_colmap_plotly_figure(model_dir)
+    if figure is None:
+        return hidden
+    return gr.update(value=figure, visible=True)
+
+
+def _snapshot_has_points(model_dir: Path) -> bool:
+    return (model_dir / "points3D.bin").is_file() or (model_dir / "points3D.txt").is_file()
+
+
+def _latest_snapshot_model_dir(snapshot_root: Path) -> Path | None:
+    """COLMAP writes snapshots to timestamped subfolders under snapshot_path."""
+    if not snapshot_root.is_dir():
+        return None
+    best: tuple[float, Path] | None = None
+    for entry in snapshot_root.iterdir():
+        if not entry.is_dir() or not _snapshot_has_points(entry):
+            continue
+        mtime = entry.stat().st_mtime
+        if best is None or mtime > best[0]:
+            best = (mtime, entry)
+    return best[1] if best else None
+
+
+def _run_mapper_with_snapshots(
+    cmd: list[str],
+    *,
+    snapshot_dir: Path,
+    snapshot_freq: int,
+    min_refresh_sec: float = COLMAP_VIEWER_REFRESH_SEC,
+) -> Any:
+    """Run COLMAP mapper; yield (exit_code, output, viewer_update | None)."""
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    full_cmd = [
+        *cmd,
+        "--Mapper.snapshot_path",
+        str(snapshot_dir),
+        "--Mapper.snapshot_frames_freq",
+        str(snapshot_freq),
+    ]
+    proc = subprocess.Popen(
+        full_cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    events: queue.Queue[tuple[str, Any]] = queue.Queue()
+    output_chunks: list[str] = []
+
+    def _stdout_reader() -> None:
+        assert proc.stdout is not None
+        try:
+            for line in proc.stdout:
+                events.put(("line", line))
+        finally:
+            events.put(("done", proc.wait()))
+
+    def _snapshot_poller() -> None:
+        last_mtime = 0.0
+        while proc.poll() is None:
+            time.sleep(0.5)
+            latest = _latest_snapshot_model_dir(snapshot_dir)
+            if latest is None:
+                continue
+            mtime = latest.stat().st_mtime
+            if mtime > last_mtime:
+                last_mtime = mtime
+                events.put(("snapshot", latest))
+
+    threading.Thread(target=_stdout_reader, daemon=True).start()
+    threading.Thread(target=_snapshot_poller, daemon=True).start()
+
+    last_preview_at = 0.0
+    last_snap_path: Path | None = None
+    viewer_update: Any | None = None
+    code: int | None = None
+
+    while code is None:
+        try:
+            kind, payload = events.get(timeout=0.5)
+        except queue.Empty:
+            continue
+
+        if kind == "line":
+            output_chunks.append(str(payload))
+            continue
+
+        if kind == "snapshot":
+            snap_model = payload
+            now = time.time()
+            if snap_model != last_snap_path or (now - last_preview_at) >= min_refresh_sec:
+                last_snap_path = snap_model
+                last_preview_at = now
+                viewer_update = _viewer_plot_update_for_sparse(snap_model)
+                yield None, "".join(output_chunks), viewer_update
+                output_chunks = []
+            continue
+
+        if kind == "done":
+            code = int(payload)
+            break
+
+    tail = "".join(output_chunks)
+    if viewer_update is None:
+        latest = _latest_snapshot_model_dir(snapshot_dir)
+        if latest is not None:
+            viewer_update = _viewer_plot_update_for_sparse(latest)
+    yield code, tail, viewer_update
+
+
+def refresh_colmap_sessions(base_dir: str):
+    choices = _discover_splat_sessions(base_dir)
+    first = choices[0] if choices else None
+    msg = f"Found **{len(choices)}** session(s) under `{Path(base_dir).expanduser()}`."
+    return gr.update(choices=choices, value=first), msg
+
+
+def load_colmap_session(base_dir: str, splat_name: str | None, log_text: str):
+    hidden_viewer = gr.update(value=None, visible=False)
+    hidden_card = gr.update(visible=False)
+    if not splat_name:
+        return (
+            _append_log(log_text, "[INFO] Select a session to load.\n"),
+            {"initialized": False, "media": []},
+            gr.update(value="No session loaded."),
+            gr.update(value="_Select a session and click **Load Session**._"),
+            hidden_viewer,
+            hidden_card,
+            gr.update(interactive=False),
+        )
+    manifest_path = Path(base_dir).expanduser() / splat_name / "manifest.json"
+    if not manifest_path.is_file():
+        return (
+            _append_log(log_text, f"[ERROR] Manifest not found: {manifest_path}\n"),
+            {"initialized": False, "media": []},
+            gr.update(value="Manifest missing."),
+            gr.update(value="_Could not load session._"),
+            hidden_viewer,
+            hidden_card,
+            gr.update(interactive=False),
+        )
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return (
+            _append_log(log_text, f"[ERROR] Failed to read manifest: {exc}\n"),
+            {"initialized": False, "media": []},
+            gr.update(value="Manifest parse error."),
+            gr.update(value="_Could not load session._"),
+            hidden_viewer,
+            hidden_card,
+            gr.update(interactive=False),
+        )
+
+    settings_block = manifest.get("settings") if isinstance(manifest.get("settings"), dict) else {}
+    projection = manifest.get("projection") if isinstance(manifest.get("projection"), dict) else {"mode": "flat"}
+    equirect_mode = bool(
+        settings_block.get(
+            "equirect_mode",
+            _is_equirect_projection(projection if isinstance(projection, dict) else {}),
+        )
+    )
+    state: dict[str, Any] = {
+        "initialized": True,
+        "splat_name": str(manifest.get("splat_name", splat_name)),
+        "splat_dir": str(manifest.get("splat_dir", manifest_path.parent)),
+        "stills_dir": str(manifest.get("stills_dir", manifest_path.parent / "stills")),
+        "fps": float(settings_block.get("fps", 1.0)),
+        "max_width": int(settings_block.get("max_width", 0)),
+        "equirect_mode": equirect_mode,
+        "projection": projection,
+        "media": manifest.get("source_media", []) if isinstance(manifest.get("source_media"), list) else [],
+        "dataset_path": str(manifest.get("dataset_path", "")),
+        "colmap_prepared": bool(manifest.get("colmap_prepared", False)),
+    }
+    frame_count = _state_frame_count(state)
+    sparse0 = _sparse0_for_state(state)
+    colmap_ready = bool(state.get("colmap_prepared")) and sparse0 is not None
+    summary = _format_sparse_summary(sparse0, stills_count=frame_count) if colmap_ready else (
+        f"_Session **{state['splat_name']}** loaded — **{frame_count}** still(s) on disk. "
+        "Click **Build COLMAP Dataset** when ready._"
+    )
+    status = (
+        f"Loaded `{state['splat_name']}` — COLMAP {'ready' if colmap_ready else 'not prepared yet'}."
+    )
+    log = _append_log(log_text, f"[INFO] Loaded session '{state['splat_name']}' from {manifest_path}\n")
+    viewer_update = _viewer_plot_update_for_sparse(sparse0) if colmap_ready else hidden_viewer
+    card_update = gr.update(visible=colmap_ready)
+    can_build = frame_count > 0 and HAS_COLMAP
+    return (
+        log,
+        state,
+        gr.update(value=status),
+        gr.update(value=summary),
+        viewer_update,
+        card_update,
+        gr.update(interactive=can_build),
     )
 
 
@@ -537,8 +1298,13 @@ def on_fps_changed(fps: float, state: dict[str, Any]):
     state["fps"] = safe_fps
     media = state.get("media", [])
     max_w = int(state.get("max_width", 0))
+    equirect = bool(state.get("equirect_mode", False))
     can_generate = len([m for m in media if m.get("status") == "ready"]) > 0 and safe_fps > 0
-    return state, gr.update(value=_estimate_summary(media, safe_fps, max_w)), gr.update(interactive=can_generate)
+    return (
+        state,
+        gr.update(value=_estimate_summary(media, safe_fps, max_w, equirect)),
+        gr.update(interactive=can_generate),
+    )
 
 
 def on_max_width_changed(max_width: int, state: dict[str, Any]):
@@ -548,7 +1314,20 @@ def on_max_width_changed(max_width: int, state: dict[str, Any]):
     state["max_width"] = safe_w
     media = state.get("media", [])
     fps = float(state.get("fps", 1.0))
-    return state, gr.update(value=_estimate_summary(media, fps, safe_w))
+    equirect = bool(state.get("equirect_mode", False))
+    return state, gr.update(value=_estimate_summary(media, fps, safe_w, equirect))
+
+
+def on_equirect_mode_changed(equirect_mode: bool, fps: float, max_width: int, state: dict[str, Any]):
+    if not state.get("initialized"):
+        return state, gr.update(value="No media loaded.")
+    enabled = bool(equirect_mode)
+    state["equirect_mode"] = enabled
+    state["projection"] = _default_projection_block(enabled)
+    media = state.get("media", [])
+    safe_fps = float(fps) if fps is not None else float(state.get("fps", 1.0))
+    safe_w = int(max_width) if max_width is not None else int(state.get("max_width", 0))
+    return state, gr.update(value=_estimate_summary(media, safe_fps, safe_w, enabled))
 
 
 def _write_manifest(state: dict[str, Any], fps: float, max_width: int) -> None:
@@ -562,7 +1341,12 @@ def _write_manifest(state: dict[str, Any], fps: float, max_width: int) -> None:
         "splat_name": splat_name,
         "splat_dir": str(splat_dir),
         "stills_dir": str(stills_dir),
-        "settings": {"fps": float(fps), "max_width": int(max_width)},
+        "settings": {
+            "fps": float(fps),
+            "max_width": int(max_width),
+            "equirect_mode": bool(state.get("equirect_mode", False)),
+        },
+        "projection": state.get("projection") or _default_projection_block(False),
         "source_media": state.get("media", []),
         "dataset_path": state.get("dataset_path", ""),
         "colmap_prepared": bool(state.get("colmap_prepared", False)),
@@ -576,6 +1360,100 @@ def _run_command(cmd: list[str]) -> tuple[int, str]:
     result = subprocess.run(cmd, capture_output=True, text=True, check=False)
     output = (result.stdout or "") + (result.stderr or "")
     return result.returncode, output
+
+
+CUBEMAP_FACE_ORDER = "frblud"
+
+
+def _parse_cubemap_still_name(name: str) -> tuple[str, int] | None:
+    m = re.match(r".*-(\d+)_([frblud])\.png$", name, re.I)
+    if not m:
+        return None
+    return m.group(2).lower(), int(m.group(1))
+
+
+def _parse_colmap_export_name(name: str) -> tuple[int, str] | None:
+    """Parse time-major COLMAP export names like 000042_f.png."""
+    m = re.match(r"^(\d+)_([frblud])\.png$", name, re.I)
+    if not m:
+        return None
+    return int(m.group(1)), m.group(2).lower()
+
+
+def _colmap_still_sort_key(path: Path) -> tuple[int, int, str]:
+    """Time-major: all cube faces for sample N, then sample N+1 (matches filesystem sort)."""
+    parsed = _parse_cubemap_still_name(path.name)
+    if parsed:
+        face, idx = parsed
+        face_rank = CUBEMAP_FACE_ORDER.index(face) if face in CUBEMAP_FACE_ORDER else 99
+        return (idx, face_rank, path.name)
+    return (99, 99, path.name)
+
+
+def _colmap_export_filename(path: Path) -> str:
+    """Rename cubemap stills for COLMAP: 000001_f.png keeps six faces per timestamp adjacent."""
+    parsed = _parse_cubemap_still_name(path.name)
+    if parsed:
+        face, idx = parsed
+        return f"{idx:06d}_{face}.png"
+    return path.name
+
+
+def _sparse_model_image_names(model_dir: Path, colmap_exe: str) -> list[str]:
+    """Read image filenames from a sparse model via a temporary TXT export."""
+    import tempfile
+
+    txt_dir = Path(tempfile.mkdtemp(prefix="splatter_colmap_txt_"))
+    try:
+        code, _ = _run_command(
+            [
+                colmap_exe,
+                "model_converter",
+                "--input_path",
+                str(model_dir),
+                "--output_path",
+                str(txt_dir),
+                "--output_type",
+                "TXT",
+            ]
+        )
+        if code != 0:
+            return []
+        images_txt = txt_dir / "images.txt"
+        if not images_txt.is_file():
+            return []
+        names: list[str] = []
+        with images_txt.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                parts = stripped.split()
+                if len(parts) >= 10 and parts[-1].lower().endswith(".png"):
+                    names.append(parts[-1])
+        return names
+    finally:
+        shutil.rmtree(txt_dir, ignore_errors=True)
+
+
+def _registered_face_summary(model_dir: Path, colmap_exe: str) -> str:
+    names = _sparse_model_image_names(model_dir, colmap_exe)
+    if not names:
+        return ""
+    counts: dict[str, int] = {face: 0 for face in CUBEMAP_FACE_ORDER}
+    for name in names:
+        parsed = _parse_colmap_export_name(name)
+        if parsed is None:
+            legacy = _parse_cubemap_still_name(name)
+            if legacy:
+                face = legacy[0]
+            else:
+                face = "?"
+        else:
+            face = parsed[1]
+        counts[face] = counts.get(face, 0) + 1
+    parts = [f"{face}={counts.get(face, 0)}" for face in CUBEMAP_FACE_ORDER if counts.get(face, 0)]
+    return ", ".join(parts) if parts else "unknown naming"
 
 
 def _find_colmap_executable() -> str | None:
@@ -762,43 +1640,78 @@ def _export_sparse_ply(colmap_exe: str, model_dir: Path) -> tuple[Path | None, s
 def prepare_colmap_dataset(state: dict[str, Any], log_text: str, progress=gr.Progress(track_tqdm=False)):
     hidden_viewer = gr.update(value=None, visible=False)
     hidden_card = gr.update(visible=False)
-    if not state.get("initialized"):
+    live_card = gr.update(visible=True)
+    live_viewer = gr.update(value=None, visible=True)
+    progress_done = "_COLMAP complete._"
+
+    def emit(
+        log: str,
+        st: dict[str, Any],
+        status: str,
+        summary: str,
+        viewer: Any,
+        card: Any,
+        progress_text: str,
+    ):
         return (
+            log,
+            st,
+            gr.update(value=status),
+            gr.update(value=summary),
+            viewer,
+            card,
+            gr.update(value=progress_text),
+        )
+
+    if not state.get("initialized"):
+        yield emit(
             _append_log(log_text, "[ERROR] Initialize splat first.\n"),
             state,
-            gr.update(value="COLMAP not prepared."),
-            gr.update(value=_format_sparse_summary(None)),
+            "COLMAP not prepared.",
+            _format_sparse_summary(None),
             hidden_viewer,
             hidden_card,
+            "_COLMAP failed — session not initialized._",
         )
+        return
     colmap_exe = _find_colmap_executable()
     if colmap_exe is None:
-        return (
+        yield emit(
             _append_log(log_text, "[ERROR] COLMAP executable not found in PATH.\n"),
             state,
-            gr.update(value="COLMAP not found in PATH."),
-            gr.update(value=_format_sparse_summary(None)),
+            "COLMAP not found in PATH.",
+            _format_sparse_summary(None),
             hidden_viewer,
             hidden_card,
+            "_COLMAP failed — executable not found._",
         )
+        return
 
     splat_dir = Path(state["splat_dir"])
     stills_dir = Path(state["stills_dir"])
-    frames = sorted(stills_dir.glob(f"{state['splat_name']}-*.png"))
+    projection = state.get("projection") or {}
+    is_cubemap = _is_equirect_projection(projection if isinstance(projection, dict) else {})
+    frames = sorted(
+        stills_dir.glob(f"{state['splat_name']}-*.png"),
+        key=_colmap_still_sort_key,
+    )
     if not frames:
-        return (
+        yield emit(
             _append_log(log_text, "[ERROR] No extracted stills found to build COLMAP dataset.\n"),
             state,
-            gr.update(value="No stills found."),
-            gr.update(value=_format_sparse_summary(None)),
+            "No stills found.",
+            _format_sparse_summary(None),
             hidden_viewer,
             hidden_card,
+            "_COLMAP failed — no stills found._",
         )
+        return
 
     dataset_dir = splat_dir / "dataset"
     images_dir = dataset_dir / "images"
     sparse_dir = dataset_dir / "sparse"
     sparse0 = sparse_dir / "0"
+    snapshot_dir = dataset_dir / "_mapper_snapshots"
     db_path = dataset_dir / "database.db"
     dataset_dir.mkdir(parents=True, exist_ok=True)
     if images_dir.exists():
@@ -807,14 +1720,58 @@ def prepare_colmap_dataset(state: dict[str, Any], log_text: str, progress=gr.Pro
     if sparse_dir.exists():
         shutil.rmtree(sparse_dir)
     sparse_dir.mkdir(parents=True, exist_ok=True)
+    if snapshot_dir.exists():
+        shutil.rmtree(snapshot_dir)
     if db_path.exists():
         db_path.unlink()
 
     log = _append_log(log_text, f"[INFO] Preparing COLMAP dataset at {dataset_dir}\n")
     progress(0.05, desc="Copying stills")
+    if is_cubemap:
+        log = _append_log(
+            log,
+            "[INFO] Cubemap export: time-major names (e.g. 000001_f.png … 000001_u.png) so all six "
+            "faces per timestamp stay adjacent. Matching uses exhaustive_matcher so every "
+            "same-face pair across time is linked (face-major order previously registered only "
+            "the first face block, e.g. all back views).\n",
+        )
     for f in frames:
-        shutil.copy2(f, images_dir / f.name)
+        shutil.copy2(f, images_dir / _colmap_export_filename(f))
     log = _append_log(log, f"[INFO] Copied {len(frames)} stills into {images_dir}\n")
+    yield emit(
+        log,
+        state,
+        "Running COLMAP feature extraction…",
+        "_Building COLMAP dataset…_",
+        live_viewer,
+        live_card,
+        "**Copying stills**",
+    )
+    matcher_name: str
+    if is_cubemap and len(frames) <= 1000:
+        matcher_name = "exhaustive_matcher"
+        matcher_cmd = [
+            colmap_exe,
+            "exhaustive_matcher",
+            "--database_path",
+            str(db_path),
+            "--FeatureMatching.use_gpu",
+            "1",
+        ]
+    else:
+        matcher_name = "sequential_matcher"
+        matcher_cmd = [
+            colmap_exe,
+            "sequential_matcher",
+            "--database_path",
+            str(db_path),
+            "--FeatureMatching.use_gpu",
+            "1",
+            "--SequentialMatching.overlap",
+            "20" if not is_cubemap else "40",
+            "--SequentialMatching.quadratic_overlap",
+            "1",
+        ]
 
     commands = [
         (
@@ -832,21 +1789,7 @@ def prepare_colmap_dataset(state: dict[str, Any], log_text: str, progress=gr.Pro
                 "1",
             ],
         ),
-        (
-            "sequential_matcher",
-            [
-                colmap_exe,
-                "sequential_matcher",
-                "--database_path",
-                str(db_path),
-                "--FeatureMatching.use_gpu",
-                "1",
-                "--SequentialMatching.overlap",
-                "20",
-                "--SequentialMatching.quadratic_overlap",
-                "1",
-            ],
-        ),
+        (matcher_name, matcher_cmd),
     ]
 
     for idx, (name, cmd) in enumerate(commands, start=1):
@@ -856,15 +1799,23 @@ def prepare_colmap_dataset(state: dict[str, Any], log_text: str, progress=gr.Pro
         if out:
             log = _append_log(log, out + "\n")
         if code != 0:
-            return (
+            yield emit(
                 _append_log(log, f"[ERROR] COLMAP {name} failed with exit code {code}.\n"),
                 state,
-                gr.update(value=f"COLMAP {name} failed."),
-                gr.update(value=_format_sparse_summary(None)),
+                f"COLMAP {name} failed.",
+                _format_sparse_summary(None),
                 hidden_viewer,
                 hidden_card,
+                f"_COLMAP failed — {name} exited with code {code}._",
             )
+            return
 
+    log = _append_log(
+        log,
+        f"[INFO] Mapper live preview: snapshots every {COLMAP_MAPPER_SNAPSHOT_FREQ} registered "
+        f"images under {snapshot_dir} (viewer refreshes about every "
+        f"{COLMAP_VIEWER_REFRESH_SEC:.0f}s once mapping begins).\n",
+    )
     mapper_attempts = [
         (
             "mapper_default",
@@ -902,29 +1853,101 @@ def prepare_colmap_dataset(state: dict[str, Any], log_text: str, progress=gr.Pro
                 "15",
             ],
         ),
+        (
+            "mapper_cubemap",
+            [
+                colmap_exe,
+                "mapper",
+                "--database_path",
+                str(db_path),
+                "--image_path",
+                str(images_dir),
+                "--output_path",
+                str(sparse_dir),
+                "--Mapper.min_num_matches",
+                "6",
+                "--Mapper.init_min_num_inliers",
+                "15",
+                "--Mapper.init_min_tri_angle",
+                "2",
+                "--Mapper.init_max_forward_motion",
+                "0.99",
+                "--Mapper.init_max_error",
+                "8",
+                "--Mapper.abs_pose_min_num_inliers",
+                "10",
+                "--Mapper.filter_max_reproj_error",
+                "8",
+            ],
+        ),
     ]
+    if not is_cubemap:
+        mapper_attempts = mapper_attempts[:2]
+
+    yield emit(
+        log,
+        state,
+        "Feature extraction and matching complete — starting mapper (point cloud preview begins now)…",
+        "_Building COLMAP dataset — mapping in progress…_",
+        live_viewer,
+        live_card,
+        "**Starting COLMAP mapper**",
+    )
 
     model_dir = None
     for idx, (name, cmd) in enumerate(mapper_attempts, start=1):
         progress(0.7 + idx * 0.12, desc=f"Running COLMAP {name}")
         log = _append_log(log, f"$ {' '.join(shlex.quote(p) for p in cmd)}\n")
-        code, out = _run_command(cmd)
-        if out:
-            log = _append_log(log, out + "\n")
+        if snapshot_dir.exists():
+            shutil.rmtree(snapshot_dir)
+        code: int | None = None
+        for code, chunk, viewer_update in _run_mapper_with_snapshots(
+            cmd,
+            snapshot_dir=snapshot_dir,
+            snapshot_freq=COLMAP_MAPPER_SNAPSHOT_FREQ,
+        ):
+            if chunk:
+                log = _append_log(log, chunk)
+            if viewer_update is not None:
+                snap_model = _latest_snapshot_model_dir(snapshot_dir) or snapshot_dir
+                snap_stats = _read_sparse_stats(snap_model)
+                summary = _format_sparse_summary(snap_model, stills_count=len(frames))
+                if isinstance(snap_stats.get("images"), int) and isinstance(snap_stats.get("points"), int):
+                    status = (
+                        f"COLMAP mapping ({name}) — "
+                        f"{snap_stats['images']} images, {snap_stats['points']:,} points…"
+                    )
+                else:
+                    status = f"COLMAP mapping ({name})…"
+                yield emit(
+                    log,
+                    state,
+                    status,
+                    summary,
+                    viewer_update,
+                    live_card,
+                    f"**Running COLMAP {name}**",
+                )
+            if code is not None:
+                break
+        if code not in (None, 0):
+            log = _append_log(log, f"[WARN] COLMAP {name} exited with code {code}.\n")
         model_dir = _largest_model_dir(sparse_dir)
         if model_dir is not None:
             break
-        log = _append_log(log, f"[WARN] COLMAP {name} did not produce a sparse model (exit code {code}).\n")
+        log = _append_log(log, f"[WARN] COLMAP {name} did not produce a sparse model.\n")
 
     if model_dir is None:
-        return (
+        yield emit(
             _append_log(log, "[ERROR] COLMAP mapper failed to create any sparse model.\n"),
             state,
-            gr.update(value="No sparse model produced."),
-            gr.update(value=_format_sparse_summary(None)),
+            "No sparse model produced.",
+            _format_sparse_summary(None),
             hidden_viewer,
             hidden_card,
+            "_COLMAP failed — no sparse model produced._",
         )
+        return
 
     # Normalise the chosen model into sparse0. Critical: only rmtree sparse0
     # when it is *not* the model itself, otherwise we'd delete the very files
@@ -957,25 +1980,30 @@ def prepare_colmap_dataset(state: dict[str, Any], log_text: str, progress=gr.Pro
         state["point_cloud_ply"] = str(ply_path)
 
     sparse_stats = _read_sparse_stats(sparse0)
+    face_summary = _registered_face_summary(sparse0, colmap_exe) if is_cubemap else ""
     _console(
         f"COLMAP done: images={sparse_stats['images']} points={sparse_stats['points']} "
         f"cameras={sparse_stats['cameras']} stills={len(frames)} ply={ply_path}"
+        + (f" faces=[{face_summary}]" if face_summary else "")
     )
+
+    if face_summary:
+        log = _append_log(
+            log,
+            f"[INFO] Registered images by cubemap face: {face_summary}\n",
+        )
 
     progress(1.0, desc="COLMAP ready")
 
-    viewer_update = (
-        gr.update(value=str(ply_path), visible=True)
-        if ply_path is not None
-        else gr.update(value=None, visible=False)
-    )
-    return (
+    viewer_update = _viewer_plot_update_for_sparse(sparse0)
+    yield emit(
         _append_log(log, f"[INFO] COLMAP dataset ready: {dataset_dir}\n"),
         state,
-        gr.update(value=f"COLMAP ready: `{dataset_dir}`"),
-        gr.update(value=_format_sparse_summary(sparse0, stills_count=len(frames))),
+        f"COLMAP ready: `{dataset_dir}`",
+        _format_sparse_summary(sparse0, stills_count=len(frames)),
         viewer_update,
         gr.update(visible=True),
+        progress_done,
     )
 
 
@@ -996,8 +2024,12 @@ def initialize_splat(splat_name: str, base_output_dir: str, fps: float, max_widt
             gr.update(value=_queue_summary_text([])),
             gr.update(value="No media loaded."),
             gr.update(interactive=False),
+            gr.update(value=False, interactive=False),
+            gr.update(value="", visible=False),
             gr.update(value=[]),
             empty_fs,
+            gr.update(interactive=False),
+            gr.update(value=""),
         )
 
     base = Path(base_output_dir).expanduser()
@@ -1017,8 +2049,12 @@ def initialize_splat(splat_name: str, base_output_dir: str, fps: float, max_widt
             gr.update(value=_queue_summary_text([])),
             gr.update(value="No media loaded."),
             gr.update(interactive=False),
+            gr.update(value=False, interactive=False),
+            gr.update(value="", visible=False),
             gr.update(value=[]),
             empty_fs,
+            gr.update(interactive=False),
+            gr.update(value=""),
         )
 
     stills_dir.mkdir(parents=True, exist_ok=True)
@@ -1030,7 +2066,10 @@ def initialize_splat(splat_name: str, base_output_dir: str, fps: float, max_widt
         "stills_dir": str(stills_dir),
         "fps": float(fps),
         "max_width": int(max_width),
+        "equirect_mode": False,
+        "projection": _default_projection_block(False),
         "media": [],
+        "staged_sources": {},
     }
     _write_manifest(state, float(fps), int(max_width))
     log = _append_log(log_text, f"[INFO] Initialized splat '{cleaned}' at {splat_dir}\n")
@@ -1047,12 +2086,16 @@ def initialize_splat(splat_name: str, base_output_dir: str, fps: float, max_widt
         gr.update(value=_queue_summary_text([])),
         gr.update(value=_estimate_summary([], float(fps))),
         gr.update(interactive=True),
+        gr.update(value=False, interactive=True),
+        gr.update(value="", visible=False),
         gr.update(value=[]),
         empty_fs,
+        gr.update(interactive=True),
+        gr.update(value=""),
     )
 
 
-def add_media(uploaded_files: Any, fps: float, state: dict[str, Any], log_text: str):
+def add_media(uploaded_files: Any, local_path: str, fps: float, state: dict[str, Any], log_text: str):
     if not state.get("initialized"):
         return (
             _append_log(log_text, "[ERROR] Initialize a unique splat name first.\n"),
@@ -1068,42 +2111,83 @@ def add_media(uploaded_files: Any, fps: float, state: dict[str, Any], log_text: 
             gr.update(value=0.0, interactive=False),
             gr.update(interactive=False),
             gr.update(interactive=False),
+            gr.update(value="", visible=False),
+            gr.update(value=""),
         )
     media = list(state.get("media", []))
     existing = {m["path"] for m in media}
-    candidates: list[str] = []
-    candidates.extend(_extract_file_paths(uploaded_files))
-
+    existing_names = {Path(m["path"]).name for m in media}
+    candidates = _collect_media_candidates(uploaded_files, local_path)
+    staged_map: dict[str, str] = dict(state.get("staged_sources") or {})
     log = log_text
     for raw in candidates:
         path = str(Path(raw).expanduser())
         if path in existing:
             continue
         p = Path(path)
-        if not p.exists():
+        if not p.is_file():
             log = _append_log(log, f"[WARN] Skipped missing path: {p}\n")
             continue
-        if p.suffix.lower() not in {".mp4", ".mov", ".mkv", ".avi"}:
+        if p.suffix.lower() not in {".mp4", ".mov", ".mkv", ".avi", ".webm"}:
             log = _append_log(log, f"[WARN] Skipped unsupported media: {p.name}\n")
             continue
         try:
-            dur = _probe_duration_seconds(p)
-            media.append({"path": str(p), "duration": dur, "start": 0.0, "end": dur, "status": "ready"})
-            existing.add(str(p))
-            log = _append_log(log, f"[INFO] Added media: {p} ({dur:.2f}s)\n")
+            staged = _resolve_staged_media_path(path, state)
+            staged_map[str(p.resolve())] = str(staged)
+            if staged.resolve() != p.resolve():
+                log = _append_log(log, f"[INFO] Staged upload to session source: {staged}\n")
+            elif _is_gradio_temp_path(p):
+                log = _append_log(log, f"[INFO] Using staged session copy: {staged}\n")
+            staged_key = str(staged)
+            if staged_key in existing or staged.name in existing_names:
+                log = _append_log(log, f"[WARN] Skipped duplicate media: {staged.name}\n")
+                continue
+            dur, stream_info = _probe_media_metadata(staged)
+            media.append(
+                {
+                    "path": staged_key,
+                    "original_upload": str(p) if staged.resolve() != p.resolve() else "",
+                    "duration": dur,
+                    "start": 0.0,
+                    "end": dur,
+                    "status": "ready",
+                    "width": stream_info.get("width", 0),
+                    "height": stream_info.get("height", 0),
+                    "projection_hints": stream_info.get("hints", []),
+                    "projection_suggestion": stream_info.get("suggestion", "flat"),
+                }
+            )
+            existing.add(staged_key)
+            existing_names.add(staged.name)
+            hint_txt = ", ".join(stream_info.get("hints") or []) or "none"
+            res = stream_info.get("width"), stream_info.get("height")
+            log = _append_log(
+                log,
+                f"[INFO] Added media: {staged.name} ({dur:.2f}s, {res[0]}×{res[1]}, projection hints: {hint_txt})\n",
+            )
         except Exception as exc:
-            log = _append_log(log, f"[WARN] Failed probing media '{p}': {exc}\n")
+            log = _append_log(log, f"[WARN] Failed probing media '{p.name}': {exc}\n")
+            if _is_gradio_temp_path(p):
+                log = _append_log(
+                    log,
+                    "[WARN] Gradio temp upload could not be read. "
+                    "Use **Or local file path** below (paste the path to pano.mp4 on disk), "
+                    "or copy the file into the session `source` folder and retry.\n",
+                )
 
+    state["staged_sources"] = staged_map
     state["media"] = media
     state["active_row"] = -1
     _write_manifest(state, float(state.get("fps", fps)), int(state.get("max_width", 0)))
     can_generate = len(media) > 0
+    equirect = bool(state.get("equirect_mode", False))
+    show_hint, hint_md = _equirect_hint_markdown(media)
     return (
         log,
         state,
         gr.update(value=_build_media_table(media)),
         gr.update(value=_queue_summary_text(media)),
-        gr.update(value=_estimate_summary(media, float(fps), int(state.get("max_width", 0)))),
+        gr.update(value=_estimate_summary(media, float(fps), int(state.get("max_width", 0)), equirect)),
         gr.update(interactive=can_generate),
         gr.update(value=None),
         gr.update(interactive=False, variant="secondary"),
@@ -1112,6 +2196,8 @@ def add_media(uploaded_files: Any, fps: float, state: dict[str, Any], log_text: 
         gr.update(value=0.0, interactive=False),
         gr.update(interactive=False),
         gr.update(interactive=False),
+        gr.update(value=hint_md, visible=show_hint),
+        gr.update(value=""),
     )
 
 
@@ -1216,7 +2302,9 @@ def apply_trim(start_val: float, end_val: float, fps: float, state: dict[str, An
         state,
         gr.update(value=_build_media_table(media)),
         gr.update(value=_queue_summary_text(media)),
-        gr.update(value=_estimate_summary(media, float(fps), int(state.get("max_width", 0)))),
+        gr.update(value=_estimate_summary(
+            media, float(fps), int(state.get("max_width", 0)), bool(state.get("equirect_mode", False))
+        )),
         gr.update(value=_active_row_label(state)),
         gr.update(interactive=len(media) > 0),
     )
@@ -1250,7 +2338,9 @@ def remove_media_row(fps: float, state: dict[str, Any], log_text: str):
         state,
         gr.update(value=_build_media_table(media)),
         gr.update(value=_queue_summary_text(media)),
-        gr.update(value=_estimate_summary(media, float(fps), int(state.get("max_width", 0)))),
+        gr.update(value=_estimate_summary(
+            media, float(fps), int(state.get("max_width", 0)), bool(state.get("equirect_mode", False))
+        )),
         gr.update(value=_active_row_label(state)),
         gr.update(value=0.0, interactive=False),
         gr.update(value=0.0, interactive=False),
@@ -1263,6 +2353,7 @@ def remove_media_row(fps: float, state: dict[str, Any], log_text: str):
 def generate_stills(
     fps: float,
     max_width: int,
+    equirect_mode: bool,
     state: dict[str, Any],
     log_text: str,
     progress=gr.Progress(track_tqdm=False),
@@ -1291,15 +2382,56 @@ def generate_stills(
         )
     state["fps"] = float(fps)
     state["max_width"] = int(max_width)
+    state["equirect_mode"] = bool(equirect_mode)
+    if equirect_mode:
+        detection = _projection_detection_from_media(media)
+        state["projection"] = _default_projection_block(True, detection)
+    else:
+        state["projection"] = _default_projection_block(False)
 
     stills_dir = Path(state["stills_dir"])
     splat_name = state["splat_name"]
-    pattern = stills_dir / f"{splat_name}-%06d.png"
     existing = sorted(stills_dir.glob(f"{splat_name}-*.png"))
-    next_index = len(existing) + 1
     log = _append_log(log_text, f"[INFO] Starting extraction from {len(media)} media files.\n")
+    if equirect_mode:
+        faces = _equirect_faces_per_frame()
+        face_list = ", ".join(CUBE_FACE_NAMES[f] for f, _, _ in EQUIRECT_CUBE_FACES)
+        log = _append_log(
+            log,
+            f"[INFO] Equirect cubemap mode: {faces} pinhole face(s) per sampled frame "
+            f"({face_list}, {EQUIRECT_FACE_FOV_DEG}° FOV). "
+            f"Face max width: {_effective_equirect_max_width(int(max_width))}px"
+            f"{' (default)' if int(max_width) <= 0 else ''}.\n",
+        )
+    if existing:
+        removed = 0
+        for old in existing:
+            try:
+                old.unlink()
+                removed += 1
+            except OSError as exc:
+                log = _append_log(log, f"[WARN] Could not remove old still {old.name}: {exc}\n")
+        log = _append_log(
+            log,
+            f"[INFO] Removed {removed} existing still(s) before re-extraction (avoids duplicate frames).\n",
+        )
+        if state.get("colmap_prepared"):
+            state["colmap_prepared"] = False
+            log = _append_log(
+                log,
+                "[INFO] COLMAP marked stale — rebuild on the **Build COLMAP Dataset** tab after review.\n",
+            )
+    next_index = 1
 
-    total = len(media)
+    tile_jobs: list[tuple[str | None, int | None, int | None, str]] = []
+    if equirect_mode:
+        for face, yaw, pitch, suffix in _equirect_cube_face_jobs():
+            tile_jobs.append((face, yaw, pitch, suffix))
+    else:
+        tile_jobs.append((None, None, None, ".png"))
+
+    total_steps = len(media) * len(tile_jobs)
+    step_done = 0
     extract_started = time.monotonic()
     for idx, item in enumerate(media, start=1):
         src = Path(item["path"])
@@ -1307,37 +2439,47 @@ def generate_stills(
         start = max(0.0, float(item.get("start", 0.0)))
         end = float(item.get("end", duration))
         end = min(end, duration)
-        vf = f"fps={fps}"
-        if int(max_width) > 0:
-            vf = f"{vf},scale='min({int(max_width)},iw)':-2"
-        cmd: list[str] = ["ffmpeg", "-y"]
-        if start > 0.0:
-            cmd.extend(["-ss", f"{start:.3f}"])
-        cmd.extend(["-i", str(src)])
-        # -t after -i is decoder-accurate; preferred over -to for trims.
-        if end > start and (start > 0.0 or end < duration):
-            cmd.extend(["-t", f"{(end - start):.3f}"])
-        cmd.extend(
-            [
-                "-vf",
-                vf,
-                "-start_number",
-                str(next_index),
-                str(pattern),
-            ]
-        )
-        log = _append_log(log, f"$ {' '.join(shlex.quote(p) for p in cmd)}\n")
-        progress((idx - 1) / total, desc=f"Processing media {idx}/{total}")
-        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-        if result.returncode != 0:
-            log = _append_log(log, f"[ERROR] ffmpeg failed for {src.name}\n{result.stderr}\n")
-            _console(f"ffmpeg failed for {src.name} rc={result.returncode}", "ERROR")
-            continue
-        if result.stderr:
-            log = _append_log(log, result.stderr + "\n")
+        trim_sec: float | None = (end - start) if end > start and (start > 0.0 or end < duration) else None
         produced = _estimate_frame_count(_trimmed_duration(item), float(fps))
-        next_index += produced
-        progress(idx / total, desc=f"Completed {idx}/{total}")
+        frame_start = next_index
+        tile_ok = 0
+
+        for face, yaw, pitch, suffix in tile_jobs:
+            step_done += 1
+            if face is None:
+                pattern = stills_dir / f"{splat_name}-%06d.png"
+                vf = _build_flat_vf(float(fps), int(max_width))
+                desc = f"Video {idx}/{len(media)}"
+            else:
+                pattern = stills_dir / f"{splat_name}-%06d{suffix}"
+                vf = _build_equirect_tile_vf(float(fps), int(yaw), int(pitch), int(max_width))
+                desc = f"Video {idx}/{len(media)} face {face} ({CUBE_FACE_NAMES.get(face, face)})"
+
+            code, out = _ffmpeg_extract_to_pattern(
+                src, pattern, vf, start, trim_sec, frame_start
+            )
+            cmd_preview = (
+                f"ffmpeg … -vf {vf!r} -start_number {frame_start} {pattern.name}"
+            )
+            log = _append_log(log, f"$ {cmd_preview}\n")
+            progress(step_done / max(1, total_steps), desc=desc)
+            if code != 0:
+                log = _append_log(log, f"[ERROR] ffmpeg failed for {src.name} ({desc})\n{out}\n")
+                _console(f"ffmpeg failed for {src.name} rc={code}", "ERROR")
+                continue
+            tile_ok += 1
+            if out:
+                log = _append_log(log, out + "\n")
+
+        if tile_ok == len(tile_jobs):
+            next_index += produced
+        elif tile_ok > 0:
+            log = _append_log(
+                log,
+                f"[WARN] Only {tile_ok}/{len(tile_jobs)} cubemap face pass(es) succeeded for {src.name}; "
+                "frame indices may be incomplete. Re-run extraction after fixing errors.\n",
+            )
+            next_index += produced
     extract_elapsed = max(0.001, time.monotonic() - extract_started)
 
     frames = sorted(stills_dir.glob(f"{splat_name}-*.png"))
@@ -1364,7 +2506,11 @@ def generate_stills(
         except OSError as exc:
             _console(f"Calibration save failed: {exc}", "WARNING")
 
-    return log, state, gr.update(value=_estimate_summary(media, float(fps), int(max_width)))
+    return log, state, gr.update(
+        value=_estimate_summary(
+            media, float(fps), int(max_width), bool(state.get("equirect_mode", False))
+        )
+    )
 
 
 def refresh_frames(state: dict[str, Any], log_text: str):
@@ -1406,6 +2552,13 @@ def reject_selected_frames(fs: dict[str, Any], state: dict[str, Any], log_text: 
 
     _write_manifest(state, float(state.get("fps", 1.0)), int(state.get("max_width", 0)))
     log = _append_log(log, f"[INFO] Deleted {deleted} frame(s). Manifest updated.\n")
+    if deleted > 0 and state.get("colmap_prepared"):
+        state["colmap_prepared"] = False
+        log = _append_log(
+            log,
+            "[INFO] COLMAP marked stale — rebuild on the **Build COLMAP Dataset** tab.\n",
+        )
+        _write_manifest(state, float(state.get("fps", 1.0)), int(state.get("max_width", 0)))
     _console(f"reject_selected deleted={deleted}")
     return log
 
@@ -1425,11 +2578,34 @@ SPLATTER_CSS = """
     color: #1f9d55;
     margin: 0 0 6px 0;
 }
+.splatter-pointcloud-viewer {
+    min-height: 520px;
+    background: #000000 !important;
+}
+.splatter-pointcloud-viewer .plotly,
+.splatter-pointcloud-viewer .js-plotly-plot,
+.splatter-pointcloud-viewer .user-select-none {
+    background: #000000 !important;
+}
+.colmap-progress-tile {
+    min-height: 56px;
+    padding: 10px 14px;
+    margin: 10px 0 14px 0;
+    border: 1px dashed rgba(255, 255, 255, 0.18);
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.02);
+}
+.colmap-progress-tile p {
+    margin: 0;
+}
 """
 
 with gr.Blocks(title="Splatter Stills Extractor V2") as demo:
     gr.Markdown("## Splatter Stills Extractor")
-    gr.Markdown("Follow the workflow from top to bottom: create session, add media, extract, review, then build COLMAP.")
+    gr.Markdown(
+        "Create a session, add media, extract stills, and review frames. "
+        "When ready, open the **Build COLMAP Dataset** tab."
+    )
     state = gr.State({"initialized": False, "media": []})
     with gr.Row():
         with gr.Column(scale=2):
@@ -1446,7 +2622,11 @@ with gr.Blocks(title="Splatter Stills Extractor V2") as demo:
             step2_group = gr.Group(visible=False)
             with step2_group:
                 gr.Markdown("### Step 2 - Add Media")
-                gr.Markdown("_Drag video files into the box below, then click **Add to Queue**._")
+                gr.Markdown(
+                    "_Drag video files into the box below, then click **Add to Queue** "
+                    "(copies into the session `source` folder). For large 360° files on Windows, "
+                    "paste a local path instead of uploading._"
+                )
                 media_upload = gr.File(
                     label="Upload media files",
                     file_count="multiple",
@@ -1454,6 +2634,14 @@ with gr.Blocks(title="Splatter Stills Extractor V2") as demo:
                     type="filepath",
                     interactive=False,
                 )
+                upload_staging_status = gr.Markdown("")
+                with gr.Row():
+                    media_path_input = gr.Textbox(
+                        label="Or local file path",
+                        placeholder=r"C:\Videos\pano.mp4",
+                        scale=4,
+                        interactive=False,
+                    )
                 add_media_button = gr.Button("Add to Queue", variant="secondary", interactive=False)
                 queue_summary = gr.Markdown(_queue_summary_text([]))
                 media_table = gr.Dataframe(
@@ -1473,10 +2661,16 @@ with gr.Blocks(title="Splatter Stills Extractor V2") as demo:
             step3_group = gr.Group(visible=False)
             with step3_group:
                 gr.Markdown("### Step 3 - Extract Frames")
+                equirect_mode = gr.Checkbox(
+                    label="Stitched equirectangular (360°) → 6 cubemap faces",
+                    value=False,
+                    interactive=False,
+                )
+                equirect_hint = gr.Markdown("", visible=False)
                 with gr.Row():
                     fps = gr.Number(label="Images per second", value=float(settings["default_fps"]), precision=3, interactive=False)
                     max_width = gr.Number(
-                        label="Max width (0 = original resolution)",
+                        label=f"Max width per cube face (0 = {EQUIRECT_DEFAULT_TILE_MAX_WIDTH}px in equirect mode)",
                         value=int(settings["default_max_width"]),
                         precision=0,
                         interactive=False,
@@ -1505,38 +2699,12 @@ with gr.Blocks(title="Splatter Stills Extractor V2") as demo:
                 )
                 reject_button = gr.Button("Delete Selected Frames", variant="stop", interactive=False)
 
-            step5_group = gr.Group(visible=False)
-            with step5_group:
-                gr.Markdown("### Step 5 - Build COLMAP Dataset")
-                prepare_colmap_button = gr.Button("Build COLMAP Dataset", interactive=False)
-                colmap_summary = gr.Markdown(_format_sparse_summary(None))
-
-                colmap_result_card = gr.Group(
-                    visible=False, elem_classes=["splatter-result-card"]
-                )
-                with colmap_result_card:
-                    gr.Markdown(
-                        "## COLMAP Complete",
-                        elem_classes=["splatter-result-header"],
-                    )
-                    gr.Markdown(
-                        "_Drag to rotate, scroll to zoom. The PLY is also saved on disk under_ "
-                        "`<session>/dataset/sparse/0/points3D.ply` _for reuse._",
-                    )
-                    point_cloud_viewer = gr.Model3D(
-                        label="Sparse point cloud",
-                        clear_color=[0.05, 0.05, 0.08, 1.0],
-                        height=480,
-                        interactive=False,
-                        visible=True,
-                    )
-
         with gr.Column(scale=1):
             workflow_status = gr.Markdown(_workflow_summary({"initialized": False, "media": []}))
             next_action = gr.Markdown(_next_action_hint({"initialized": False, "media": []}))
 
     initial_colmap_msg = (
-        "COLMAP status: Ready to run."
+        "COLMAP runs on the **Build COLMAP Dataset** tab."
         if HAS_COLMAP
         else "COLMAP status: `colmap` not found in PATH. Install COLMAP to enable preparation."
     )
@@ -1578,30 +2746,29 @@ with gr.Blocks(title="Splatter Stills Extractor V2") as demo:
             queue_summary,
             estimate,
             refresh_frames_button,
+            equirect_mode,
+            equirect_hint,
             frame_gallery,
             frames_state,
+            media_path_input,
+            upload_staging_status,
         ],
     ).then(
         fn=lambda: (
             gr.update(interactive=True),
-            gr.update(interactive=HAS_COLMAP),
             gr.update(interactive=True),
             gr.update(interactive=True),
             gr.update(interactive=True),
         ),
-        outputs=[reject_button, prepare_colmap_button, select_all_button, invert_button, clear_button],
+        outputs=[reject_button, select_all_button, invert_button, clear_button],
     ).then(
         fn=_workflow_ui_updates,
         inputs=[state],
-        outputs=[workflow_status, next_action, step2_group, step3_group, step4_group, step5_group],
+        outputs=[workflow_status, next_action, step2_group, step3_group, step4_group],
     ).then(
         fn=_preview_session_path,
         inputs=[splat_name, base_output_dir, state],
         outputs=[name_preview, initialize_button],
-    ).then(
-        fn=lambda: (gr.update(visible=False), gr.update(value=None, visible=False)),
-        inputs=None,
-        outputs=[colmap_result_card, point_cloud_viewer],
     ).then(
         fn=_extract_inline_error,
         inputs=[log_output],
@@ -1610,7 +2777,7 @@ with gr.Blocks(title="Splatter Stills Extractor V2") as demo:
 
     add_media_button.click(
         fn=add_media,
-        inputs=[media_upload, fps, state, log_output],
+        inputs=[media_upload, media_path_input, fps, state, log_output],
         outputs=[
             log_output,
             state,
@@ -1625,11 +2792,13 @@ with gr.Blocks(title="Splatter Stills Extractor V2") as demo:
             trim_end,
             apply_trim_button,
             remove_button,
+            equirect_hint,
+            media_path_input,
         ],
     ).then(
         fn=_workflow_ui_updates,
         inputs=[state],
-        outputs=[workflow_status, next_action, step2_group, step3_group, step4_group, step5_group],
+        outputs=[workflow_status, next_action, step2_group, step3_group, step4_group],
     ).then(
         fn=_extract_inline_error,
         inputs=[log_output],
@@ -1637,8 +2806,14 @@ with gr.Blocks(title="Splatter Stills Extractor V2") as demo:
     )
 
     media_upload.change(
-        fn=_add_to_queue_update,
+        fn=_on_media_upload_changed,
         inputs=[media_upload, state],
+        outputs=[add_media_button, upload_staging_status],
+    )
+
+    media_path_input.change(
+        fn=_local_path_queue_button,
+        inputs=[media_path_input, media_upload, state],
         outputs=[add_media_button],
     )
 
@@ -1663,7 +2838,7 @@ with gr.Blocks(title="Splatter Stills Extractor V2") as demo:
     ).then(
         fn=_workflow_ui_updates,
         inputs=[state],
-        outputs=[workflow_status, next_action, step2_group, step3_group, step4_group, step5_group],
+        outputs=[workflow_status, next_action, step2_group, step3_group, step4_group],
     ).then(
         fn=_extract_inline_error,
         inputs=[log_output],
@@ -1689,7 +2864,7 @@ with gr.Blocks(title="Splatter Stills Extractor V2") as demo:
     ).then(
         fn=_workflow_ui_updates,
         inputs=[state],
-        outputs=[workflow_status, next_action, step2_group, step3_group, step4_group, step5_group],
+        outputs=[workflow_status, next_action, step2_group, step3_group, step4_group],
     ).then(
         fn=_extract_inline_error,
         inputs=[log_output],
@@ -1703,7 +2878,7 @@ with gr.Blocks(title="Splatter Stills Extractor V2") as demo:
     ).then(
         fn=_workflow_ui_updates,
         inputs=[state],
-        outputs=[workflow_status, next_action, step2_group, step3_group, step4_group, step5_group],
+        outputs=[workflow_status, next_action, step2_group, step3_group, step4_group],
     )
 
     max_width.change(
@@ -1712,9 +2887,19 @@ with gr.Blocks(title="Splatter Stills Extractor V2") as demo:
         outputs=[state, estimate],
     )
 
+    equirect_mode.change(
+        fn=on_equirect_mode_changed,
+        inputs=[equirect_mode, fps, max_width, state],
+        outputs=[state, estimate],
+    ).then(
+        fn=_workflow_ui_updates,
+        inputs=[state],
+        outputs=[workflow_status, next_action, step2_group, step3_group, step4_group],
+    )
+
     generate_button.click(
         fn=generate_stills,
-        inputs=[fps, max_width, state, log_output],
+        inputs=[fps, max_width, equirect_mode, state, log_output],
         outputs=[log_output, state, estimate],
     ).then(
         fn=_update_frame_review_ui,
@@ -1723,7 +2908,7 @@ with gr.Blocks(title="Splatter Stills Extractor V2") as demo:
     ).then(
         fn=_workflow_ui_updates,
         inputs=[state],
-        outputs=[workflow_status, next_action, step2_group, step3_group, step4_group, step5_group],
+        outputs=[workflow_status, next_action, step2_group, step3_group, step4_group],
     ).then(
         fn=_extract_inline_error,
         inputs=[log_output],
@@ -1741,7 +2926,7 @@ with gr.Blocks(title="Splatter Stills Extractor V2") as demo:
     ).then(
         fn=_workflow_ui_updates,
         inputs=[state],
-        outputs=[workflow_status, next_action, step2_group, step3_group, step4_group, step5_group],
+        outputs=[workflow_status, next_action, step2_group, step3_group, step4_group],
     ).then(
         fn=_extract_inline_error,
         inputs=[log_output],
@@ -1759,7 +2944,7 @@ with gr.Blocks(title="Splatter Stills Extractor V2") as demo:
     ).then(
         fn=_workflow_ui_updates,
         inputs=[state],
-        outputs=[workflow_status, next_action, step2_group, step3_group, step4_group, step5_group],
+        outputs=[workflow_status, next_action, step2_group, step3_group, step4_group],
     ).then(
         fn=_extract_inline_error,
         inputs=[log_output],
@@ -1786,29 +2971,180 @@ with gr.Blocks(title="Splatter Stills Extractor V2") as demo:
         inputs=[frames_state],
         outputs=[frames_state, frame_gallery, selection_summary],
     )
-    prepare_colmap_button.click(
-        fn=lambda: (gr.update(visible=False), gr.update(value=None, visible=False)),
-        inputs=None,
-        outputs=[colmap_result_card, point_cloud_viewer],
-    ).then(
-        fn=prepare_colmap_dataset,
-        inputs=[state, log_output],
+
+
+with gr.Blocks(title="Splatter COLMAP Builder") as colmap_demo:
+    gr.Markdown("## Build COLMAP Dataset")
+    gr.Markdown(
+        "Load a splat session that already has extracted stills, run COLMAP, and preview the "
+        "sparse point cloud (vertex colors from reconstruction, auto-scaled to fit the viewer)."
+    )
+    colmap_state = gr.State({"initialized": False, "media": []})
+    with gr.Row():
+        with gr.Column(scale=2):
+            with gr.Group():
+                gr.Markdown("### Step 1 — Load session")
+                with gr.Row():
+                    colmap_base_dir = gr.Textbox(
+                        label="Splatter sessions base dir",
+                        value=settings["base_output_dir"],
+                        scale=3,
+                    )
+                    colmap_refresh_btn = gr.Button("Refresh Sessions", scale=1)
+                colmap_session_selector = gr.Dropdown(
+                    label="Splat session",
+                    choices=[],
+                    value=None,
+                )
+                colmap_load_btn = gr.Button("Load Session", variant="primary")
+                colmap_session_status = gr.Markdown("_Select a session and click **Load Session**._")
+
+            with gr.Group():
+                gr.Markdown("### Step 2 — Run COLMAP")
+                colmap_prepare_button = gr.Button(
+                    "Build COLMAP Dataset",
+                    variant="primary",
+                    interactive=False,
+                )
+                colmap_progress = gr.Markdown(
+                    "_Progress appears here while COLMAP runs._",
+                    elem_classes=["colmap-progress-tile"],
+                )
+                colmap_summary = gr.Markdown(_format_sparse_summary(None))
+
+            colmap_result_card = gr.Group(visible=False, elem_classes=["splatter-result-card"])
+            with colmap_result_card:
+                gr.Markdown("## COLMAP preview", elem_classes=["splatter-result-header"])
+                gr.Markdown(
+                    "_Drag to rotate, scroll to zoom. The scatter plot appears once **mapping** starts "
+                    "(after feature extraction and matching finish), then updates every few "
+                    "registered images. Download the raw model from "
+                    "`<session>/dataset/sparse/0/points3D.ply`_"
+                )
+                colmap_point_cloud_viewer = gr.Plot(
+                    label="Sparse point cloud",
+                    show_label=False,
+                    container=True,
+                    elem_classes=["splatter-pointcloud-viewer"],
+                )
+
+        with gr.Column(scale=1):
+            colmap_workflow_status = gr.Markdown("### COLMAP workflow\n- Session: not loaded")
+            colmap_next_action = gr.Markdown(
+                "### Next Action\nRefresh sessions, pick a splat, and click **Load Session**."
+            )
+
+    colmap_initial_msg = (
+        "COLMAP status: Ready to run."
+        if HAS_COLMAP
+        else "COLMAP status: `colmap` not found in PATH. Install COLMAP to enable preparation."
+    )
+    colmap_run_status = gr.Markdown(colmap_initial_msg)
+    colmap_last_error = gr.Markdown("", visible=False)
+    with gr.Accordion("Execution log", open=False):
+        colmap_log_output = gr.Textbox(
+            label="Execution Console",
+            value="",
+            lines=16,
+            max_lines=32,
+            interactive=False,
+        )
+
+    colmap_refresh_btn.click(
+        fn=refresh_colmap_sessions,
+        inputs=[colmap_base_dir],
+        outputs=[colmap_session_selector, colmap_session_status],
+    )
+    colmap_load_btn.click(
+        fn=load_colmap_session,
+        inputs=[colmap_base_dir, colmap_session_selector, colmap_log_output],
         outputs=[
-            log_output,
-            state,
-            colmap_status,
+            colmap_log_output,
+            colmap_state,
+            colmap_run_status,
             colmap_summary,
-            point_cloud_viewer,
+            colmap_point_cloud_viewer,
             colmap_result_card,
+            colmap_prepare_button,
         ],
     ).then(
-        fn=_workflow_ui_updates,
-        inputs=[state],
-        outputs=[workflow_status, next_action, step2_group, step3_group, step4_group, step5_group],
+        fn=lambda st: (
+            gr.update(
+                value=(
+                    "### COLMAP workflow\n"
+                    f"- Session: **{st.get('splat_name', '?')}**\n"
+                    f"- Frames on disk: **{_state_frame_count(st)}**\n"
+                    f"- COLMAP: **{'ready' if st.get('colmap_prepared') else 'not prepared'}**"
+                )
+            ),
+            gr.update(
+                value=(
+                    "### Next Action\n"
+                    + (
+                        "Dataset ready — switch to **Train Splat**."
+                        if st.get("colmap_prepared")
+                        else "Click **Build COLMAP Dataset** when stills look good."
+                    )
+                )
+            ),
+        ),
+        inputs=[colmap_state],
+        outputs=[colmap_workflow_status, colmap_next_action],
     ).then(
         fn=_extract_inline_error,
-        inputs=[log_output],
-        outputs=[last_error],
+        inputs=[colmap_log_output],
+        outputs=[colmap_last_error],
+    )
+
+    colmap_prepare_button.click(
+        fn=lambda: (
+            gr.update(visible=True),
+            gr.update(value=None, visible=True),
+            gr.update(value="_COLMAP running — see progress below._"),
+        ),
+        inputs=None,
+        outputs=[colmap_result_card, colmap_point_cloud_viewer, colmap_progress],
+    ).then(
+        fn=prepare_colmap_dataset,
+        inputs=[colmap_state, colmap_log_output],
+        outputs=[
+            colmap_log_output,
+            colmap_state,
+            colmap_run_status,
+            colmap_summary,
+            colmap_point_cloud_viewer,
+            colmap_result_card,
+            colmap_progress,
+        ],
+        show_progress="full",
+        show_progress_on=colmap_progress,
+    ).then(
+        fn=lambda st: (
+            gr.update(
+                value=(
+                    "### COLMAP workflow\n"
+                    f"- Session: **{st.get('splat_name', '?')}**\n"
+                    f"- Frames on disk: **{_state_frame_count(st)}**\n"
+                    f"- COLMAP: **{'ready' if st.get('colmap_prepared') else 'not prepared'}**"
+                )
+            ),
+            gr.update(
+                value=(
+                    "### Next Action\n"
+                    + (
+                        "Dataset ready — switch to **Train Splat**."
+                        if st.get("colmap_prepared")
+                        else "Review the log and retry COLMAP if needed."
+                    )
+                )
+            ),
+        ),
+        inputs=[colmap_state],
+        outputs=[colmap_workflow_status, colmap_next_action],
+    ).then(
+        fn=_extract_inline_error,
+        inputs=[colmap_log_output],
+        outputs=[colmap_last_error],
     )
 
 

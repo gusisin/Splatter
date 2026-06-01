@@ -1,5 +1,6 @@
 # Splatter unified UI dependencies
 gradio>=4.0.0
+plotly>=5.0.0
 # Pillow is pulled in transitively by Gradio today, but stills_extractor_app.py
 # imports PIL directly to build gallery thumbnails, so declare it explicitly.
 Pillow>=10.0.0

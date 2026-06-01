@@ -262,12 +262,15 @@ def export_run_to_ply(base_dir: str, splat_name: str, run_label: str):
 with gr.Blocks(title="Splatter Unified App") as demo:
     gr.Markdown("## Splatter")
     gr.Markdown(
-        "Use one app for the full workflow: extract stills + COLMAP, train splats, and view run outputs."
+        "Use one app for the full workflow: extract stills, build COLMAP, train splats, and view run outputs."
     )
 
     with gr.Tabs():
-        with gr.Tab("Produce Stills and COLMAP Files"):
+        with gr.Tab("Produce Stills"):
             stills_extractor_app.demo.render()
+
+        with gr.Tab("Build COLMAP Dataset"):
+            stills_extractor_app.colmap_demo.render()
 
         with gr.Tab("Train Splat"):
             gui_wrapper.demo.render()
