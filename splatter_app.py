@@ -6,7 +6,10 @@ from pathlib import Path
 
 import gradio as gr
 
-import gui_wrapper
+try:
+    import gui_wrapper
+except (ImportError, SyntaxError):
+    import gui_wrapper_new as gui_wrapper
 import stills_extractor_app
 
 APP_DIR = Path(__file__).resolve().parent

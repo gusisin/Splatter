@@ -13,6 +13,8 @@ from typing import Any
 
 import gradio as gr
 
+from training_recommendations import TrainingPriority, plan_for_session, training_hydra_overrides
+
 WRAPPER_DIR = Path(__file__).resolve().parent
 # Match install.ps1: clone nv-tlabs/3dgrut into tools/3dgrut and run install_env_uv.ps1 there.
 DEFAULT_REPO_DIR = WRAPPER_DIR / "tools" / "3dgrut"
@@ -83,27 +85,92 @@ def refresh_splats(base_dir: str, current_log: str):
     return _append_log(current_log, msg), gr.update(choices=choices, value=(choices[0] if choices else None))
 
 
+def _apply_training_plan_updates(plan, recommendation_md: str):
+    mode = plan.mode if plan else "3DGUT"
+    mode_choices = MODE_CONFIG_CHOICES.get(mode, MODE_CONFIG_CHOICES["3DGUT"])
+    config_value = plan.config_name if plan and plan.config_name in mode_choices else mode_choices[0]
+    return (
+        gr.update(value=mode),
+        gr.update(choices=mode_choices, value=config_value),
+        gr.update(value=int(plan.downsample) if plan else 2),
+        gr.update(value=int(plan.iterations) if plan else 30_000),
+        gr.update(value=plan.optimizer if plan else "selective_adam"),
+        gr.update(value=recommendation_md),
+    )
+
+
+def apply_training_priority(
+    data_path: str,
+    splat_base_dir: str,
+    splat_name: str,
+    priority: str,
+):
+    prio: TrainingPriority = priority if priority in ("speed", "balanced", "quality") else "balanced"
+    plan, recommendation_md = plan_for_session(
+        data_path,
+        prio,
+        splat_base_dir=splat_base_dir,
+        splat_name=splat_name or "",
+    )
+    return _apply_training_plan_updates(plan, recommendation_md)
+
+
 def load_splat_session(splat_base_dir: str, splat_name: str, current_log: str):
     if not splat_name:
-        return current_log, gr.update(), gr.update(), gr.update(), gr.update(value="No splat selected.")
+        empty = gr.update()
+        return (
+            current_log,
+            empty,
+            empty,
+            empty,
+            gr.update(value="No splat selected."),
+            gr.update(
+                value=(
+                    "### Training recommendation\n"
+                    "Select a splat session to see suggested splat counts and training presets."
+                )
+            ),
+            empty,
+            empty,
+            empty,
+            empty,
+            empty,
+            empty,
+        )
     manifest_path = Path(splat_base_dir).expanduser() / splat_name / "manifest.json"
     if not manifest_path.exists():
+        empty = gr.update()
         return (
             _append_log(current_log, f"[ERROR] Manifest not found: {manifest_path}\n"),
-            gr.update(),
-            gr.update(),
-            gr.update(),
+            empty,
+            empty,
+            empty,
             gr.update(value=f"Manifest not found for '{splat_name}'."),
+            empty,
+            empty,
+            empty,
+            empty,
+            empty,
+            empty,
+            empty,
         )
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except Exception as exc:
+        empty = gr.update()
         return (
             _append_log(current_log, f"[ERROR] Failed to read manifest: {exc}\n"),
-            gr.update(),
-            gr.update(),
-            gr.update(),
+            empty,
+            empty,
+            empty,
             gr.update(value=f"Failed to parse manifest for '{splat_name}'."),
+            empty,
+            empty,
+            empty,
+            empty,
+            empty,
+            empty,
+            empty,
         )
 
     dataset_path = manifest.get("dataset_path", "")
@@ -123,12 +190,20 @@ def load_splat_session(splat_base_dir: str, splat_name: str, current_log: str):
         if sibling_has_sparse:
             chosen_data_path = str(sibling_dataset)
     if not chosen_data_path:
+        empty = gr.update()
         return (
             _append_log(current_log, "[ERROR] Manifest missing usable dataset/stills path.\n"),
-            gr.update(),
-            gr.update(),
-            gr.update(),
+            empty,
+            empty,
+            empty,
             gr.update(value=f"Manifest for '{splat_name}' missing usable data path."),
+            empty,
+            empty,
+            empty,
+            empty,
+            empty,
+            empty,
+            empty,
         )
     out_dir = str((Path(splat_base_dir).expanduser() / splat_name / "runs").expanduser())
     source_label = "dataset_path" if chosen_data_path == str(Path(dataset_path).expanduser()) and dataset_path else "stills_dir"
@@ -138,12 +213,26 @@ def load_splat_session(splat_base_dir: str, splat_name: str, current_log: str):
         f"[INFO] Loaded splat session '{splat_name}' from {manifest_path} (using {source_label}).\n",
     )
     status_extra = "COLMAP prepared" if colmap_ready else "COLMAP not prepared"
+    plan, recommendation_md = plan_for_session(
+        chosen_data_path,
+        "balanced",
+        splat_base_dir=splat_base_dir,
+        splat_name=splat_name,
+    )
+    plan_updates = _apply_training_plan_updates(plan, recommendation_md)
     return (
         log,
         gr.update(value=chosen_data_path),
         gr.update(value=splat_name),
         gr.update(value=out_dir),
         gr.update(value=f"Loaded splat: `{splat_name}` ({status_extra})"),
+        plan_updates[5],
+        plan_updates[0],
+        plan_updates[1],
+        plan_updates[2],
+        plan_updates[3],
+        plan_updates[4],
+        gr.update(value="balanced"),
     )
 
 
@@ -340,6 +429,7 @@ def _build_command(
     optimizer: str,
     export_usdz: bool,
     conda_env: str,
+    hydra_overrides: list[str] | None = None,
 ) -> list[str]:
     repo_root, train_script = _repo_paths(repo_dir)
     command: list[str] = []
@@ -365,6 +455,8 @@ def _build_command(
     )
     if resume_checkpoint.strip():
         command.append(f"resume={str(Path(resume_checkpoint).expanduser())}")
+    if hydra_overrides:
+        command.extend(hydra_overrides)
     return command
 
 
@@ -518,6 +610,9 @@ def start_training(
     export_usdz: bool,
     gpu_selection: str,
     conda_env: str,
+    training_priority: str,
+    splat_base_dir: str,
+    splat_name: str,
     run_state: dict[str, Any],
 ):
     with PROCESS_LOCK:
@@ -596,6 +691,16 @@ def start_training(
                     )
 
         repo_root, _ = _repo_paths(repo_dir)
+        prio: TrainingPriority = (
+            training_priority if training_priority in ("speed", "balanced", "quality") else "balanced"
+        )
+        plan, _ = plan_for_session(
+            resolved_data_path,
+            prio,
+            splat_base_dir=splat_base_dir,
+            splat_name=splat_name or experiment_name.strip(),
+        )
+        hydra_overrides = training_hydra_overrides(plan) if plan else []
         command = _build_command(
             repo_dir=repo_dir,
             config_name=config_name,
@@ -608,6 +713,7 @@ def start_training(
             optimizer=optimizer,
             export_usdz=export_usdz,
             conda_env=conda_env,
+            hydra_overrides=hydra_overrides,
         )
         command_preview = " ".join(shlex.quote(part) for part in command)
         selected_gpu, gpu_message = _resolve_gpu_selection(gpu_selection)
@@ -989,6 +1095,15 @@ with gr.Blocks(title="3DGRUT Trainer UI (External Wrapper)") as demo:
         refresh_splats_button = gr.Button("Refresh Splats", scale=1)
         load_splat_button = gr.Button("Load Splat Session", scale=1)
     splat_status = gr.Markdown("No splat loaded.")
+    training_priority = gr.Radio(
+        choices=["speed", "balanced", "quality"],
+        value="balanced",
+        label="Training priority",
+        info="Speed caps splats and uses MCMC; Quality allows fuller densification.",
+    )
+    training_recommendation = gr.Markdown(
+        "Load a splat session to see suggested splat counts and training presets."
+    )
     with gr.Row():
         data_path = gr.Textbox(label="data_path", placeholder=r"C:\path\to\dataset", value="", scale=2)
         experiment_name = gr.Textbox(label="experiment_name", placeholder="lego_3dgut", value="", scale=1)
@@ -1045,9 +1160,36 @@ with gr.Blocks(title="3DGRUT Trainer UI (External Wrapper)") as demo:
             export_usdz,
             gpu_selection,
             conda_env,
+            training_priority,
+            splat_base_dir,
+            splat_selector,
             run_state,
         ],
         outputs=[log_output, run_state, start_button, kill_button],
+    )
+    training_priority.change(
+        fn=apply_training_priority,
+        inputs=[data_path, splat_base_dir, splat_selector, training_priority],
+        outputs=[
+            mode,
+            config_name,
+            downsample,
+            iterations,
+            optimizer,
+            training_recommendation,
+        ],
+    )
+    data_path.change(
+        fn=apply_training_priority,
+        inputs=[data_path, splat_base_dir, splat_selector, training_priority],
+        outputs=[
+            mode,
+            config_name,
+            downsample,
+            iterations,
+            optimizer,
+            training_recommendation,
+        ],
     )
     mode.change(fn=_update_config_choices, inputs=[mode], outputs=[config_name])
     save_preset_button.click(
@@ -1099,7 +1241,20 @@ with gr.Blocks(title="3DGRUT Trainer UI (External Wrapper)") as demo:
     load_splat_button.click(
         fn=load_splat_session,
         inputs=[splat_base_dir, splat_selector, log_output],
-        outputs=[log_output, data_path, experiment_name, out_dir, splat_status],
+        outputs=[
+            log_output,
+            data_path,
+            experiment_name,
+            out_dir,
+            splat_status,
+            training_recommendation,
+            mode,
+            config_name,
+            downsample,
+            iterations,
+            optimizer,
+            training_priority,
+        ],
     )
     refresh_gpus_button.click(
         fn=refresh_gpu_list,
